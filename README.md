@@ -7,7 +7,7 @@
 開発者向けセットアップ手順:
 
 ```powershell
-git clone <このリポジトリのURL>
+git clone https://github.com/prevalmam/modbus-master-regmap-generator.git
 cd modbus-master-regmap-generator
 pip install .
 ```
