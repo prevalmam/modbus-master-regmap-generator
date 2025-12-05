@@ -1,0 +1,24 @@
+# ---- Python キャッシュ ----
+__pycache__/
+*.pyc
+
+# ---- 仮想環境 ----
+venv/
+.env/
+
+# ---- ビルド成果物（setuptools, wheel, pyinstaller）----
+build/
+dist/
+*.egg-info/
+*.spec
+
+# ---- PyInstaller / cx_Freeze 等のビルド ----
+*.exe
+*.dll
+
+# ---- OS / エディタ固有ファイル ----
+.DS_Store
+Thumbs.db
+
+# ---- VSCode ----
+.vscode/
