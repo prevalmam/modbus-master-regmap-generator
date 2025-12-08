@@ -203,16 +203,19 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
             ])
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
-            for kind, cond in [
+            scalar_type = "uint32_t" if entry_type == "REG_TYPE_MASTER_UINT32" else "uint16_t"
+            cond_templates = [
                 ("rising", "((prev & bit_mask) == 0U) && ((curr & bit_mask) != 0U)"),
                 ("falling", "((prev & bit_mask) != 0U) && ((curr & bit_mask) == 0U)"),
                 ("toggled", "((prev ^ curr) & bit_mask) != 0U")
-            ]:
+            ]
+
+            for kind, cond in cond_templates:
                 c_lines.extend([
-                    f"int detect_{name}_{kind}(uint16_t bit_mask)",
+                    f"int detect_{name}_{kind}({scalar_type} bit_mask)",
                     "{",
-                    f"    static uint16_t prev;  // assuming uint16_t always here",
-                    f"    uint16_t curr = get_{name}();",
+                    f"    static {scalar_type} prev;",
+                    f"    {scalar_type} curr = get_{name}();",
                     f"    if ({cond})",
                     "    {",
                     "        prev = curr;",
@@ -262,16 +265,18 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
             ])
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16_ARRAY", "REG_TYPE_MASTER_UINT32_ARRAY"):
+            array_type = "uint32_t" if entry_type == "REG_TYPE_MASTER_UINT32_ARRAY" else "uint16_t"
+
             for kind, cond in [
                 ("rising", "((prev[index] & bit_mask) == 0U) && ((curr & bit_mask) != 0U)"),
                 ("falling", "((prev[index] & bit_mask) != 0U) && ((curr & bit_mask) == 0U)"),
                 ("toggled", "((prev[index] ^ curr) & bit_mask) != 0U")
             ]:
                 c_lines.extend([
-                    f"int detect_{name}_{kind}_edge(uint16_t index, uint16_t bit_mask)",
+                    f"int detect_{name}_{kind}_edge(uint16_t index, {array_type} bit_mask)",
                     "{",
-                    f"    static uint16_t prev[{length}];",
-                    f"    uint16_t curr;",
+                    f"    static {array_type} prev[{length}];",
+                    f"    {array_type} curr;",
                     f"    if (index >= {length}U) return 0;",
                     f"    curr = get_{name}(index);",
                     f"    if ({cond})",
@@ -287,8 +292,8 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
             c_lines.extend([
                 f"int detect_{name}_any_changed(void)",
                 "{",
-                f"    static uint16_t prev[{length}];",
-                f"    uint16_t curr;",
+                f"    static {array_type} prev[{length}];",
+                f"    {array_type} curr;",
                 "    uint16_t i;",
                 f"    for (i = 0; i < {length}; ++i)",
                 "    {",
@@ -326,14 +331,16 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
         if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
             c_lines.append(f"    (void)detect_{name}_changed();")
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
+            mask_literal = "0xFFFFFFFFUL" if entry_type == "REG_TYPE_MASTER_UINT32" else "0xFFFFU"
             for kind in ("rising", "falling", "toggled"):
-                c_lines.append(f"    (void)detect_{name}_{kind}(0xFFFF);")
+                c_lines.append(f"    (void)detect_{name}_{kind}({mask_literal});")
         elif entry_type == "REG_TYPE_MASTER_FLOAT_ARRAY":
             c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_changed(i);")
             c_lines.append(f"    (void)detect_{name}_any_changed();")
         elif entry_type in ("REG_TYPE_MASTER_UINT16_ARRAY", "REG_TYPE_MASTER_UINT32_ARRAY"):
+            mask_literal = "0xFFFFFFFFUL" if entry_type == "REG_TYPE_MASTER_UINT32_ARRAY" else "0xFFFFU"
             for kind in ("rising", "falling", "toggled"):
-                c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_{kind}_edge(i, 0xFFFF);")
+                c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_{kind}_edge(i, {mask_literal});")
             c_lines.append(f"    (void)detect_{name}_any_changed();")
     c_lines.append("}")
 
@@ -359,16 +366,18 @@ def write_modbus_reg_edge_master_h(out_dir, entries):
             h_lines.append(f"int detect_{name}_changed(void);")
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
+            mask_type = "uint32_t" if entry_type == "REG_TYPE_MASTER_UINT32" else "uint16_t"
             for kind in ("rising", "falling", "toggled"):
-                h_lines.append(f"int detect_{name}_{kind}(uint16_t bit_mask);")
+                h_lines.append(f"int detect_{name}_{kind}({mask_type} bit_mask);")
 
         elif entry_type == "REG_TYPE_MASTER_FLOAT_ARRAY":
             h_lines.append(f"int detect_{name}_changed(uint16_t index);")
             h_lines.append(f"int detect_{name}_any_changed(void);")
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16_ARRAY", "REG_TYPE_MASTER_UINT32_ARRAY"):
+            mask_type = "uint32_t" if entry_type == "REG_TYPE_MASTER_UINT32_ARRAY" else "uint16_t"
             for kind in ("rising", "falling", "toggled"):
-                h_lines.append(f"int detect_{name}_{kind}_edge(uint16_t index, uint16_t bit_mask);")
+                h_lines.append(f"int detect_{name}_{kind}_edge(uint16_t index, {mask_type} bit_mask);")
             h_lines.append(f"int detect_{name}_any_changed(void);")
 
     h_lines.append("")
