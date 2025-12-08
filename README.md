@@ -279,7 +279,7 @@ void update_device_mode(uint16_t new_value)
 | `Macro_Name` | ArrayLen のマクロ名 |
 | `Value` | マクロの値 |
 
-![LengthDefs シートの例](images/format_lengthdefs.png)
+![LengthDefs シートの例](images/format_LengthDefs.png)
 
 ※プロジェクトに応じて追加カラムは自由に拡張できます。  
 
@@ -287,7 +287,7 @@ void update_device_mode(uint16_t new_value)
 
 D4セルに Modbus スレーブアドレス（10進数）を指定します。
 
-![Config シートの例](images/format_config.png)
+![Config シートの例](images/format_Config.png)
 
 ---
 
