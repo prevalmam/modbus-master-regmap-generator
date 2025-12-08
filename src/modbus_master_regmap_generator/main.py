@@ -18,6 +18,35 @@ def get_register_count(entry_type: str, length: int) -> int:
 def sanitize_var_name(var_name: str) -> str:
     return str(var_name).replace(".", "_").strip()
 
+
+def resolve_length(length_cell, length_defs: dict) -> int:
+    if pd.isna(length_cell):
+        return 1
+
+    if isinstance(length_cell, (int, float)) and not isinstance(length_cell, bool):
+        try:
+            value = int(length_cell)
+            return value if value > 0 else 1
+        except (TypeError, ValueError):
+            pass
+
+    length_str = str(length_cell).strip()
+    if length_str == "":
+        return 1
+
+    try:
+        value = int(length_str, 0)
+        return value if value > 0 else 1
+    except (TypeError, ValueError):
+        pass
+
+    if length_str in length_defs:
+        value = int(length_defs[length_str])
+        return value if value > 0 else 1
+
+    print(f"Warning: ArrayLen '{length_cell}' could not be resolved. Using 1 as fallback.")
+    return 1
+
 def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
     c_lines = [
         '#include "modbus_reply_handler_master.h"',
@@ -336,12 +365,12 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
                 c_lines.append(f"    (void)detect_{name}_{kind}({mask_literal});")
         elif entry_type == "REG_TYPE_MASTER_FLOAT_ARRAY":
             c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_changed(i);")
-            c_lines.append(f"    (void)detect_{name}_any_changed();")
+            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_any_changed();")
         elif entry_type in ("REG_TYPE_MASTER_UINT16_ARRAY", "REG_TYPE_MASTER_UINT32_ARRAY"):
             mask_literal = "0xFFFFFFFFUL" if entry_type == "REG_TYPE_MASTER_UINT32_ARRAY" else "0xFFFFU"
             for kind in ("rising", "falling", "toggled"):
                 c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_{kind}_edge(i, {mask_literal});")
-            c_lines.append(f"    (void)detect_{name}_any_changed();")
+            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_any_changed();")
     c_lines.append("}")
 
     with open(os.path.join(out_dir, "modbus_reg_edge_master.c"), "w", encoding="utf-8") as f:
@@ -1028,10 +1057,7 @@ def main():
         except (ValueError, TypeError):
             continue
 
-        try:
-            length = int(row[5])
-        except (ValueError, TypeError):
-            length = 1
+        length = resolve_length(row[5], length_defs)
 
         vmin_str = str(row[7]).strip() if pd.notna(row[7]) else "0"        # Min
         vmax_str = str(row[8]).strip() if pd.notna(row[8]) else "0xFFFF"   # Max
