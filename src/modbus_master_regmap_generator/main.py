@@ -4,7 +4,7 @@ from tkinter import filedialog
 import os
 import textwrap
 
-MODBUS_SLAVE_ADDR = 0x01  # スレーブアドレス定義（任意に変更可）
+DEFAULT_MODBUS_SLAVE_ADDR = 1  # Configシート未設定時のフォールバック値
 
 # 1レジスタ = 2バイト前提で、型に応じたレジスタ数を計算（未使用）（g_reg_table の size を参照）
 def get_register_count(entry_type: str, length: int) -> int:
@@ -46,6 +46,44 @@ def resolve_length(length_cell, length_defs: dict) -> int:
 
     print(f"Warning: ArrayLen '{length_cell}' could not be resolved. Using 1 as fallback.")
     return 1
+
+
+def _parse_positive_int(value) -> int:
+    if pd.isna(value):
+        raise ValueError("value is NaN")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        parsed = int(value)
+    else:
+        text = str(value).strip()
+        if text == "":
+            raise ValueError("value is empty")
+        parsed = int(text, 0)
+
+    if parsed <= 0:
+        raise ValueError("value is not positive")
+
+    return parsed
+
+
+def read_modbus_slave_addr(excel_path: str) -> int:
+    try:
+        config_df = pd.read_excel(excel_path, sheet_name="Config", header=None)
+    except Exception as exc:
+        print(f"Warning: Configシートを読み込めませんでした ({exc}). 既定値を使用します。")
+        return DEFAULT_MODBUS_SLAVE_ADDR
+
+    try:
+        raw_value = config_df.iat[3, 3]
+    except (IndexError, ValueError):
+        print("Warning: Config!D4 が見つかりません。既定値を使用します。")
+        return DEFAULT_MODBUS_SLAVE_ADDR
+
+    try:
+        return _parse_positive_int(raw_value)
+    except ValueError:
+        print(f"Warning: Config!D4 '{raw_value}' は不正です。既定値を使用します。")
+        return DEFAULT_MODBUS_SLAVE_ADDR
 
 def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
     c_lines = [
@@ -599,12 +637,13 @@ def write_modbus_reg_access_master_h(out_dir, entries):
     with open(os.path.join(out_dir, "modbus_reg_access_master.h"), "w", encoding="utf-8") as f:
         f.write("\n".join(h_lines))
 
-def write_modbus_reg_idx_master_h(out_dir, entries):
+def write_modbus_reg_idx_master_h(out_dir, entries, slave_addr):
+    slave_literal = int(slave_addr)
     idx_lines = [
         "#ifndef MODBUS_REG_IDX_MASTER_H",
         "#define MODBUS_REG_IDX_MASTER_H",
         "",
-        "#define MODBUS_SLAVE_ADDR 0x01",
+        f"#define MODBUS_SLAVE_ADDR {slave_literal}",
         "",
         "/* Master-side Modbus register index definitions */"
     ]
@@ -1022,6 +1061,7 @@ def main():
 
     reg_table_df = pd.read_excel(file_path, sheet_name="RegisterTable", header=None)
     lengthdefs_df = pd.read_excel(file_path, sheet_name="LengthDefs", header=None)
+    modbus_slave_addr = read_modbus_slave_addr(file_path)
 
     header_row_index = None
     for i, row in reg_table_df.iterrows():
@@ -1102,7 +1142,7 @@ def main():
 
     write_modbus_reg_map_master_h(out_dir, entries, length_defs)
     write_modbus_reg_map_master_c(out_dir, entries)
-    write_modbus_reg_idx_master_h(out_dir, entries)
+    write_modbus_reg_idx_master_h(out_dir, entries, modbus_slave_addr)
     write_modbus_reg_access_master_h(out_dir, entries)
     write_modbus_reg_access_master_c(out_dir, entries)
     write_modbus_reg_edge_master_h(out_dir, entries)
