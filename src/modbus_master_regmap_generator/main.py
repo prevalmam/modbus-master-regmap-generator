@@ -1020,7 +1020,7 @@ def main():
             continue
 
         try:
-            length = int(row[6])
+            length = int(row[5])
         except (ValueError, TypeError):
             length = 1
 
