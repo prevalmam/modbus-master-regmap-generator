@@ -893,7 +893,7 @@ def write_modbus_sender_generic(out_dir):
         '#include "modbus_sender_generic.h"',
         '#include "modbus_crc_util.h"',
         '#include "modbus_sender_gen.h"',
-        '#include "modbus_reg_idx.h"',
+        '#include "modbus_reg_idx_master.h"',
         "",
         "int modbus_sender_generic_u16(const uint16_t *data, uint16_t addr, uint16_t len)",
         "{",
