@@ -52,10 +52,33 @@ Modbus のレジマップやプロトコル部分は仕様書で厳密に決ま�
 ---
 
 ## 3.クイックスタート
+### 3.1. EXE版を使う
 
-### 3.1.インストール
+#### 3.1.1. ダウンロード
+Windows 向けの実行ファイル（exe）は  
+GitHub Releases ページからダウンロードできます。
 
-開発者向けセットアップ手順:
+➡ **[Releases ページはこちら](https://github.com/prevalmam/modbus-master-regmap-generator/releases)**
+
+最新バージョンの Assets から  
+`modbus-master-regmap-generator.exe` をダウンロードしてください。
+
+#### 3.1.2. SHA-256（検証用）
+
+配布している実行ファイルの SHA-256 ハッシュ値は  
+Releases の Assets に含まれる `SHA256SUMS.txt` に記載しています。
+
+ダウンロード後、以下のコマンドで検証できます。
+```powershell
+certutil -hashfile modbus-master-regmap-generator.exe SHA256
+```
+出力されたハッシュ値が SHA256SUMS.txt に記載されている値と一致すれば、
+ファイルが改ざんされていないことを確認できます。
+
+### 3.2. ソースコードから使う
+
+#### 3.2.1. git clone + pip install
+次に示すコマンドを実行して，ソースコードをクローンし，pip でインストールします。
 
 ```powershell
 git clone https://github.com/prevalmam/modbus-master-regmap-generator.git
