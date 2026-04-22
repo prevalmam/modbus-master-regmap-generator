@@ -161,7 +161,7 @@ void modbus_sender_output(const uint8_t *data, uint16_t len)
     }
     ```
 
-2. **`modbus_reg_edge_master_init()` でエッジ検出のプリロードを行う** — 上記の RAM セット後にこの関数を 1 回呼ぶと、すべてのエッジ検出器が「現在値＝前回値」で同期され、初回ポーリング時の誤検知を防げます。以降は周期タスクや受信ハンドラから各 `detect_*` 関数をそのまま利用できます。
+2. **`modbus_reg_edge_master_init()` でエッジ検出のプリロードを行う** — 上記の RAM セット後にこの関数を 1 回呼ぶと、すべてのエッジ検出器が「現在値＝前回値」で同期され、初回ポーリング時の誤検知を防げます。以降は周期タスクや受信ハンドラから各 `detect_master_*` 関数をそのまま利用できます。
 
 ```c
 void app_init(void)
@@ -198,7 +198,7 @@ void poll_uptime_sec(void)
 ```c
 void update_device_mode(uint16_t new_value)
 {
-    set_device_mode(new_value);             /* RAM を最新値で更新 */
+    set_master_device_mode(new_value);      /* RAM を最新値で更新 */
     modbus_sender_set_device_mode();        /* 直近ブロックを丸ごと 0x10 で送信 */
 }
 ```
@@ -227,20 +227,20 @@ void update_device_mode(uint16_t new_value)
 
 #### 4.5.1 値の読み出し（getter）
 
-    uint16_t mode = get_device_mode();
-    float process_value = get_process_value();
+    uint16_t mode = get_master_device_mode();
+    float process_value = get_master_process_value();
 
 #### 4.5.2 値の書き換え（setter）
 
-    set_device_mode(2);
-    set_process_value(36.5f);
+    set_master_device_mode(2);
+    set_master_process_value(36.5f);
 
 なお、setter は min/max チェックを自動で行います。 範囲外の値をセットしようとした場合は何も変更されません。
 
 #### 4.5.3 下限値・上限値の取得
 
-    uint16_t min_mode = get_device_mode_min();
-    uint16_t max_mode = get_device_mode_max();
+    uint16_t min_mode = get_master_device_mode_min();
+    uint16_t max_mode = get_master_device_mode_max();
 ---
 
 ### 4.6 エッジ検出（値変化の検知）
@@ -248,7 +248,7 @@ void update_device_mode(uint16_t new_value)
 #### 4.6.1 立ち上がり検出の例（単体値）
 
 ```c
-    if (detect_device_mode_rising(0xffff)) {
+    if (detect_master_device_mode_rising(0xffff)) {
         // 0 → 1 に変化したときだけ実行
     }
 ```
@@ -258,7 +258,7 @@ void update_device_mode(uint16_t new_value)
 #### 4.6.2 立ち下がり検出の例（単体値）
 
 ```c
-    if (detect_device_mode_falling(0xffff)) {
+    if (detect_master_device_mode_falling(0xffff)) {
         // 1 → 0 に変化したときだけ実行
     }
 ```
@@ -266,7 +266,7 @@ void update_device_mode(uint16_t new_value)
 #### 4.6.3 トグル検出の例（配列値）
 
 ```c
-    if (detect_discrete_inputs_toggled(0x0003)) {
+    if (detect_master_discrete_inputs_toggled(0x0003)) {
         // ビット 0 またはビット 1 が変化したときだけ実行
     }
 ```

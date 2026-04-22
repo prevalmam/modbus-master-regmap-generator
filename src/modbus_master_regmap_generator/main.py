@@ -289,10 +289,10 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
 
         if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
             c_lines.extend([
-                f"int detect_{name}_changed(void)",
+                f"int detect_master_{name}_changed(void)",
                 "{",
                 f"    static float prev;",
-                f"    float curr = get_{name}();",
+                f"    float curr = get_master_{name}();",
                 "    if (!is_float_equal(prev, curr))",
                 "    {",
                 "        prev = curr;",
@@ -313,10 +313,10 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
 
             for kind, cond in cond_templates:
                 c_lines.extend([
-                    f"int detect_{name}_{kind}({scalar_type} bit_mask)",
+                    f"int detect_master_{name}_{kind}({scalar_type} bit_mask)",
                     "{",
                     f"    static {scalar_type} prev;",
-                    f"    {scalar_type} curr = get_{name}();",
+                    f"    {scalar_type} curr = get_master_{name}();",
                     f"    if ({cond})",
                     "    {",
                     "        prev = curr;",
@@ -329,12 +329,12 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
 
         elif entry_type == "REG_TYPE_MASTER_FLOAT_ARRAY":
             c_lines.extend([
-                f"int detect_{name}_changed(uint16_t index)",
+                f"int detect_master_{name}_changed(uint16_t index)",
                 "{",
                 f"    static float prev[{length}];",
                 "    float curr;",
                 f"    if (index >= {length}U) return 0;",
-                f"    curr = get_{name}(index);",
+                f"    curr = get_master_{name}(index);",
                 f"    if (!is_float_equal(prev[index], curr))",
                 "    {",
                 "        prev[index] = curr;",
@@ -346,14 +346,14 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
             ])
 
             c_lines.extend([
-                f"int detect_{name}_any_changed(void)",
+                f"int detect_master_{name}_any_changed(void)",
                 "{",
                 f"    static float prev[{length}];",
                 "    float curr;",
                 "    uint16_t i;",
                 f"    for (i = 0; i < {length}; ++i)",
                 "    {",
-                f"        curr = get_{name}(i);",
+                f"        curr = get_master_{name}(i);",
                 f"        if (!is_float_equal(prev[i], curr))",
                 "        {",
                 "            prev[i] = curr;",
@@ -374,12 +374,12 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
                 ("toggled", "((prev[index] ^ curr) & bit_mask) != 0U")
             ]:
                 c_lines.extend([
-                    f"int detect_{name}_{kind}_edge(uint16_t index, {array_type} bit_mask)",
+                    f"int detect_master_{name}_{kind}_edge(uint16_t index, {array_type} bit_mask)",
                     "{",
                     f"    static {array_type} prev[{length}];",
                     f"    {array_type} curr;",
                     f"    if (index >= {length}U) return 0;",
-                    f"    curr = get_{name}(index);",
+                    f"    curr = get_master_{name}(index);",
                     f"    if ({cond})",
                     "    {",
                     "        prev[index] = curr;",
@@ -391,14 +391,14 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
                 ])
 
             c_lines.extend([
-                f"int detect_{name}_any_changed(void)",
+                f"int detect_master_{name}_any_changed(void)",
                 "{",
                 f"    static {array_type} prev[{length}];",
                 f"    {array_type} curr;",
                 "    uint16_t i;",
                 f"    for (i = 0; i < {length}; ++i)",
                 "    {",
-                f"        curr = get_{name}(i);",
+                f"        curr = get_master_{name}(i);",
                 "        if (curr != prev[i])",
                 "        {",
                 "            prev[i] = curr;",
@@ -430,19 +430,19 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
         length = entry["length"]
 
         if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
-            c_lines.append(f"    (void)detect_{name}_changed();")
+            c_lines.append(f"    (void)detect_master_{name}_changed();")
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
             mask_literal = "0xFFFFFFFFUL" if entry_type == "REG_TYPE_MASTER_UINT32" else "0xFFFFU"
             for kind in ("rising", "falling", "toggled"):
-                c_lines.append(f"    (void)detect_{name}_{kind}({mask_literal});")
+                c_lines.append(f"    (void)detect_master_{name}_{kind}({mask_literal});")
         elif entry_type == "REG_TYPE_MASTER_FLOAT_ARRAY":
-            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_changed(i);")
-            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_any_changed();")
+            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_master_{name}_changed(i);")
+            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_master_{name}_any_changed();")
         elif entry_type in ("REG_TYPE_MASTER_UINT16_ARRAY", "REG_TYPE_MASTER_UINT32_ARRAY"):
             mask_literal = "0xFFFFFFFFUL" if entry_type == "REG_TYPE_MASTER_UINT32_ARRAY" else "0xFFFFU"
             for kind in ("rising", "falling", "toggled"):
-                c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_{kind}_edge(i, {mask_literal});")
-            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_{name}_any_changed();")
+                c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_master_{name}_{kind}_edge(i, {mask_literal});")
+            c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_master_{name}_any_changed();")
     c_lines.append("}")
 
     with open(os.path.join(out_dir, "modbus_reg_edge_master.c"), "w", encoding="utf-8") as f:
@@ -464,22 +464,22 @@ def write_modbus_reg_edge_master_h(out_dir, entries):
         is_array = entry["length"] > 1
 
         if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
-            h_lines.append(f"int detect_{name}_changed(void);")
+            h_lines.append(f"int detect_master_{name}_changed(void);")
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
             mask_type = "uint32_t" if entry_type == "REG_TYPE_MASTER_UINT32" else "uint16_t"
             for kind in ("rising", "falling", "toggled"):
-                h_lines.append(f"int detect_{name}_{kind}({mask_type} bit_mask);")
+                h_lines.append(f"int detect_master_{name}_{kind}({mask_type} bit_mask);")
 
         elif entry_type == "REG_TYPE_MASTER_FLOAT_ARRAY":
-            h_lines.append(f"int detect_{name}_changed(uint16_t index);")
-            h_lines.append(f"int detect_{name}_any_changed(void);")
+            h_lines.append(f"int detect_master_{name}_changed(uint16_t index);")
+            h_lines.append(f"int detect_master_{name}_any_changed(void);")
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16_ARRAY", "REG_TYPE_MASTER_UINT32_ARRAY"):
             mask_type = "uint32_t" if entry_type == "REG_TYPE_MASTER_UINT32_ARRAY" else "uint16_t"
             for kind in ("rising", "falling", "toggled"):
-                h_lines.append(f"int detect_{name}_{kind}_edge(uint16_t index, {mask_type} bit_mask);")
-            h_lines.append(f"int detect_{name}_any_changed(void);")
+                h_lines.append(f"int detect_master_{name}_{kind}_edge(uint16_t index, {mask_type} bit_mask);")
+            h_lines.append(f"int detect_master_{name}_any_changed(void);")
 
     h_lines.append("")
     h_lines.append("#endif")
@@ -568,20 +568,20 @@ def write_modbus_reg_access_master_c(out_dir, entries):
 
         # get
         if is_array:
-            c_lines.append(f"{base_type} get_{name}(uint16_t index)")
+            c_lines.append(f"{base_type} get_master_{name}(uint16_t index)")
             c_lines.append("{")
             c_lines.append(f"    if (index >= {entry['length']}U) {{ return ({base_type})0; }}")
             c_lines.append(f"    return (({base_type} *)({entry_ref}.ram_ptr))[index];")
             c_lines.append("}")
         else:
-            c_lines.append(f"{base_type} get_{name}(void)")
+            c_lines.append(f"{base_type} get_master_{name}(void)")
             c_lines.append("{")
             c_lines.append(f"    return {read_func}({entry_ref}.ram_ptr);")
             c_lines.append("}")
 
         # set
         if is_array:
-            c_lines.append(f"int set_{name}(uint16_t index, {base_type} value)")
+            c_lines.append(f"int set_master_{name}(uint16_t index, {base_type} value)")
             c_lines.append("{")
             c_lines.append(f"    const {base_type} min = {read_func}({entry_ref}.min_value);")
             c_lines.append(f"    const {base_type} max = {read_func}({entry_ref}.max_value);")
@@ -591,7 +591,7 @@ def write_modbus_reg_access_master_c(out_dir, entries):
             c_lines.append("    return 1;")
             c_lines.append("}")
         else:
-            c_lines.append(f"int set_{name}({base_type} value)")
+            c_lines.append(f"int set_master_{name}({base_type} value)")
             c_lines.append("{")
             c_lines.append(f"    const {base_type} min = {read_func}({entry_ref}.min_value);")
             c_lines.append(f"    const {base_type} max = {read_func}({entry_ref}.max_value);")
@@ -602,22 +602,22 @@ def write_modbus_reg_access_master_c(out_dir, entries):
 
         # masked setter
         if not is_array and base_type in ("uint16_t", "uint32_t"):
-            c_lines.append(f"int set_{name}_masked({base_type} mask, {base_type} value)")
+            c_lines.append(f"int set_master_{name}_masked({base_type} mask, {base_type} value)")
             c_lines.append("{")
-            c_lines.append(f"    {base_type} current = get_{name}();")
+            c_lines.append(f"    {base_type} current = get_master_{name}();")
             c_lines.append(f"    value &= mask;")
             c_lines.append(f"    current &= (uint16_t)(~mask);")
             c_lines.append(f"    current |= value;")
-            c_lines.append(f"    return set_{name}(current);")
+            c_lines.append(f"    return set_master_{name}(current);")
             c_lines.append("}")
 
         # min/max
-        c_lines.append(f"{base_type} get_{name}_min(void)")
+        c_lines.append(f"{base_type} get_master_{name}_min(void)")
         c_lines.append("{")
         c_lines.append(f"    return {read_func}({entry_ref}.min_value);")
         c_lines.append("}")
 
-        c_lines.append(f"{base_type} get_{name}_max(void)")
+        c_lines.append(f"{base_type} get_master_{name}_max(void)")
         c_lines.append("{")
         c_lines.append(f"    return {read_func}({entry_ref}.max_value);")
         c_lines.append("}")
@@ -653,17 +653,17 @@ def write_modbus_reg_access_master_h(out_dir, entries):
         is_array = entry["length"] > 1
 
         if is_array:
-            h_lines.append(f"{base_type} get_{name}(uint16_t index);")
-            h_lines.append(f"int set_{name}(uint16_t index, {base_type} value);")
+            h_lines.append(f"{base_type} get_master_{name}(uint16_t index);")
+            h_lines.append(f"int set_master_{name}(uint16_t index, {base_type} value);")
         else:
-            h_lines.append(f"{base_type} get_{name}(void);")
-            h_lines.append(f"int set_{name}({base_type} value);")
+            h_lines.append(f"{base_type} get_master_{name}(void);")
+            h_lines.append(f"int set_master_{name}({base_type} value);")
 
             if base_type in ("uint16_t", "uint32_t"):
-                h_lines.append(f"int set_{name}_masked({base_type} mask, {base_type} value);")
+                h_lines.append(f"int set_master_{name}_masked({base_type} mask, {base_type} value);")
 
-        h_lines.append(f"{base_type} get_{name}_min(void);")
-        h_lines.append(f"{base_type} get_{name}_max(void);")
+        h_lines.append(f"{base_type} get_master_{name}_min(void);")
+        h_lines.append(f"{base_type} get_master_{name}_max(void);")
         h_lines.append("")
 
     h_lines.append("#endif")
@@ -816,9 +816,9 @@ def write_modbus_reg_map_master_c(out_dir, entries):
         vmin = e['min_value'].split('{')[1].rstrip('}').strip()
         vmax = e['max_value'].split('{')[1].rstrip('}').strip()
 
-        c_lines.append(f"const {value_type} default_{e['name']}[{count}] = {{{vdef}}};")
-        c_lines.append(f"const {value_type} min_{e['name']}[{count}] = {{{vmin}}};")
-        c_lines.append(f"const {value_type} max_{e['name']}[{count}] = {{{vmax}}};")
+        c_lines.append(f"const {value_type} default_master_{e['name']}[{count}] = {{{vdef}}};")
+        c_lines.append(f"const {value_type} min_master_{e['name']}[{count}] = {{{vmin}}};")
+        c_lines.append(f"const {value_type} max_master_{e['name']}[{count}] = {{{vmax}}};")
         c_lines.append("")
 
     c_lines.append("const reg_table_master_entry_t g_reg_table_master[] = {")
@@ -827,9 +827,9 @@ def write_modbus_reg_map_master_c(out_dir, entries):
         c_lines.append(f"        \"{e['name']}\",")
         c_lines.append(f"        {e['modbus_addr']},")
         c_lines.append(f"        {e['size']},")
-        c_lines.append(f"        default_{e['name']},")
-        c_lines.append(f"        min_{e['name']},")
-        c_lines.append(f"        max_{e['name']},")
+        c_lines.append(f"        default_master_{e['name']},")
+        c_lines.append(f"        min_master_{e['name']},")
+        c_lines.append(f"        max_master_{e['name']},")
         c_lines.append(f"        {e['ram_ptr']},")
         c_lines.append(f"        {e['type']},")
         c_lines.append(f"        {e['length']},")
@@ -1143,8 +1143,9 @@ def main():
         #vmax_str = str(row[9]).strip() if pd.notna(row[6]) else "0xFFFF"
 
         # RAM宣言を追加
-        ram_decl = generate_static_definition(var_type, var_name, length, vdef_str)
-        ram_ptr = f"{var_name}" if length > 1 else f"&{var_name}"
+        master_var_name = f"master_{var_name}"
+        ram_decl = generate_static_definition(var_type, master_var_name, length, vdef_str)
+        ram_ptr = f"{master_var_name}" if length > 1 else f"&{master_var_name}"
 
         def format_array_init(val):
             return ", ".join([format_value_for_init(var_type, val)] * length)
