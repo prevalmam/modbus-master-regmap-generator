@@ -307,7 +307,7 @@ void update_device_mode(uint16_t new_value)
 
 #### 5.1.3.Config シート
 
-D4セルに Modbus スレーブアドレス（10進数）を指定します。
+Config シートの C 列で `SLAVE_ADDR` と記載された行を探し、その行の D 列に Modbus スレーブアドレス（10進数または `0x` 付き16進数）を指定します。
 
 ![Config シートの例](images/format_Config.png)
 

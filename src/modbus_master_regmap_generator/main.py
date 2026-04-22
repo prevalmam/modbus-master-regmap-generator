@@ -70,19 +70,35 @@ def read_modbus_slave_addr(excel_path: str) -> int:
     try:
         config_df = pd.read_excel(excel_path, sheet_name="Config", header=None)
     except Exception as exc:
-        print(f"Warning: Configシートを読み込めませんでした ({exc}). 既定値を使用します。")
+        print(f"Warning: failed to read Config sheet ({exc}). Using default Modbus slave address.")
         return DEFAULT_MODBUS_SLAVE_ADDR
 
     try:
-        raw_value = config_df.iat[3, 3]
-    except (IndexError, ValueError):
-        print("Warning: Config!D4 が見つかりません。既定値を使用します。")
+        key_col = config_df.iloc[:, 2]
+    except IndexError:
+        print("Warning: Config sheet has no column C. Using default Modbus slave address.")
+        return DEFAULT_MODBUS_SLAVE_ADDR
+
+    target_row = None
+    for row_idx, key in key_col.items():
+        if str(key).strip().upper() == "SLAVE_ADDR":
+            target_row = row_idx
+            break
+
+    if target_row is None:
+        print("Warning: SLAVE_ADDR was not found in Config column C. Using default Modbus slave address.")
+        return DEFAULT_MODBUS_SLAVE_ADDR
+
+    try:
+        raw_value = config_df.loc[target_row, 3]
+    except (KeyError, IndexError, ValueError):
+        print("Warning: column D value for SLAVE_ADDR is missing. Using default Modbus slave address.")
         return DEFAULT_MODBUS_SLAVE_ADDR
 
     try:
         return _parse_positive_int(raw_value)
     except ValueError:
-        print(f"Warning: Config!D4 '{raw_value}' は不正です。既定値を使用します。")
+        print(f"Warning: SLAVE_ADDR value '{raw_value}' is invalid. Using default Modbus slave address.")
         return DEFAULT_MODBUS_SLAVE_ADDR
 
 def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
