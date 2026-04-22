@@ -2,6 +2,7 @@ import pandas as pd
 import tkinter as tk
 from tkinter import filedialog
 import os
+import re
 import textwrap
 
 DEFAULT_MODBUS_SLAVE_ADDR = 1  # Configシート未設定時のフォールバック値
@@ -17,6 +18,23 @@ def get_register_count(entry_type: str, length: int) -> int:
 
 def sanitize_var_name(var_name: str) -> str:
     return str(var_name).replace(".", "_").strip()
+
+
+def sanitize_c_identifier(raw_name: str, default_prefix: str = "group") -> str:
+    text = str(raw_name).strip()
+    if text == "":
+        return f"{default_prefix}_unnamed"
+
+    sanitized = re.sub(r"[^0-9A-Za-z_]", "_", text)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+
+    if sanitized == "":
+        sanitized = f"{default_prefix}_unnamed"
+
+    if sanitized[0].isdigit():
+        sanitized = f"{default_prefix}_{sanitized}"
+
+    return sanitized.lower()
 
 
 def resolve_length(length_cell, length_defs: dict) -> int:
@@ -66,6 +84,19 @@ def _parse_positive_int(value) -> int:
     return parsed
 
 
+def _parse_int_auto_base(value) -> int:
+    if pd.isna(value):
+        raise ValueError("value is NaN")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+
+    text = str(value).strip()
+    if text == "":
+        raise ValueError("value is empty")
+    return int(text, 0)
+
+
 def read_modbus_slave_addr(excel_path: str) -> int:
     try:
         config_df = pd.read_excel(excel_path, sheet_name="Config", header=None)
@@ -100,6 +131,80 @@ def read_modbus_slave_addr(excel_path: str) -> int:
     except ValueError:
         print(f"Warning: SLAVE_ADDR value '{raw_value}' is invalid. Using default Modbus slave address.")
         return DEFAULT_MODBUS_SLAVE_ADDR
+
+
+def read_read_plan(excel_path: str) -> list:
+    try:
+        read_plan_df = pd.read_excel(excel_path, sheet_name="ReadPlan", header=None)
+    except Exception as exc:
+        print(f"Info: ReadPlan sheet was not loaded ({exc}). Group read requests will not be generated.")
+        return []
+
+    header_row_index = None
+    for i, row in read_plan_df.iterrows():
+        if str(row[2] if 2 in row.index else "").strip() == "GroupName":
+            header_row_index = i
+            break
+
+    if header_row_index is None:
+        print("Warning: ReadPlan header 'GroupName' was not found in column C. Group read requests will not be generated.")
+        return []
+
+    plans = []
+    used_suffixes = set()
+
+    for i in range(header_row_index + 1, len(read_plan_df)):
+        row = read_plan_df.iloc[i]
+
+        if str(row[1] if 1 in row.index else "").strip().upper() == "EOF":
+            break
+
+        group_cell = row[2] if 2 in row.index else pd.NA
+        addr_cell = row[3] if 3 in row.index else pd.NA
+        count_cell = row[4] if 4 in row.index else pd.NA
+
+        if pd.isna(group_cell) and pd.isna(addr_cell) and pd.isna(count_cell):
+            continue
+
+        group_name = str(group_cell).strip() if pd.notna(group_cell) else ""
+        if group_name == "":
+            print(f"Warning: ReadPlan row {i + 1} has empty GroupName. Skipping.")
+            continue
+
+        try:
+            start_addr = _parse_int_auto_base(addr_cell)
+            reg_count = _parse_int_auto_base(count_cell)
+        except ValueError:
+            print(f"Warning: ReadPlan row {i + 1} has invalid StartAddr/RegCount. Skipping.")
+            continue
+
+        if not (0 <= start_addr <= 0xFFFF):
+            print(f"Warning: ReadPlan row {i + 1} StartAddr '{start_addr}' is out of range (0..65535). Skipping.")
+            continue
+
+        if not (1 <= reg_count <= 125):
+            print(f"Warning: ReadPlan row {i + 1} RegCount '{reg_count}' is out of range (1..125). Skipping.")
+            continue
+
+        suffix_base = sanitize_c_identifier(group_name, default_prefix="group")
+        suffix = suffix_base
+        duplicate_index = 2
+        while suffix in used_suffixes:
+            suffix = f"{suffix_base}_{duplicate_index}"
+            duplicate_index += 1
+
+        if suffix != suffix_base:
+            print(f"Warning: ReadPlan group '{group_name}' was duplicated. Using function suffix '{suffix}'.")
+
+        used_suffixes.add(suffix)
+        plans.append({
+            "group_name": group_name,
+            "func_suffix": suffix,
+            "start_addr": int(start_addr),
+            "reg_count": int(reg_count),
+        })
+
+    return plans
 
 def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
     c_lines = [
@@ -895,7 +1000,9 @@ def write_modbus_reg_map_master_c(out_dir, entries):
         f.write("\n".join(c_lines))
 
 
-def write_modbus_sender_gen_c(c_path, entries):
+def write_modbus_sender_gen_c(c_path, entries, read_plans=None):
+    if read_plans is None:
+        read_plans = []
     c_lines = [
         '#include "modbus_sender_gen.h"',
         '#include "modbus_sender_generic.h"',
@@ -906,6 +1013,23 @@ def write_modbus_sender_gen_c(c_path, entries):
         'static uint8_t s_modbus_frame_buf[256];',
         'static uint16_t s_last_read_addr = 0;',
         'static uint16_t s_last_read_regs = 0;',
+        '',
+        'static void modbus_sender_send_read_request(uint16_t start_addr, uint16_t reg_count)',
+        '{',
+        '    uint8_t *frame = s_modbus_frame_buf;',
+        '    uint16_t pos = 0;',
+        '',
+        '    frame[pos++] = MODBUS_SLAVE_ADDR;',
+        '    frame[pos++] = 0x03;',
+        '    frame[pos++] = (uint8_t)(start_addr >> 8U);',
+        '    frame[pos++] = (uint8_t)(start_addr & 0xFFU);',
+        '    frame[pos++] = (uint8_t)(reg_count >> 8U);',
+        '    frame[pos++] = (uint8_t)(reg_count & 0xFFU);',
+        '',
+        '    modbus_sender_output(frame, modbus_append_crc(frame, pos));',
+        '    s_last_read_addr = start_addr;',
+        '    s_last_read_regs = reg_count;',
+        '}',
         ''
     ]
 
@@ -923,20 +1047,17 @@ def write_modbus_sender_gen_c(c_path, entries):
         #count_expr = f"get_register_count(\"{e['type']}\", {base}.length)"
         c_lines.append(f"void modbus_sender_req_{e['name']}(void)")
         c_lines.append("{")
-        c_lines.append("    uint8_t *frame = s_modbus_frame_buf;")        
-        c_lines.append("    uint16_t pos = 0;")
-        c_lines.append("    frame[pos++] = MODBUS_SLAVE_ADDR;")
-        c_lines.append("    frame[pos++] = 0x03;")
-        c_lines.append(f"    frame[pos++] = (uint8_t)({base}.modbus_addr >> 8);")
-        c_lines.append(f"    frame[pos++] = (uint8_t)({base}.modbus_addr & 0xFF);")        
-        c_lines.append(f"    uint16_t reg_count = (uint16_t)({base}.size / 2);")
-        c_lines.append("    frame[pos++] = (uint8_t)(reg_count >> 8);")
-        c_lines.append("    frame[pos++] = (uint8_t)(reg_count & 0xFF);")
-        c_lines.append("    uint16_t total_len = modbus_append_crc(frame, pos);")
-        c_lines.append("    modbus_sender_output(frame, total_len);")
+        c_lines.append(f"    const uint16_t reg_count = (uint16_t)({base}.size / 2U);")
+        c_lines.append(f"    modbus_sender_send_read_request((uint16_t){base}.modbus_addr, reg_count);")
+        c_lines.append("}")
         c_lines.append("")
-        c_lines.append(f"    s_last_read_addr = {base}.modbus_addr;")
-        c_lines.append(f"    s_last_read_regs = {base}.size / 2;")
+
+    for plan in read_plans:
+        c_lines.append(f"void modbus_sender_req_group_{plan['func_suffix']}(void)")
+        c_lines.append("{")
+        c_lines.append(
+            f"    modbus_sender_send_read_request((uint16_t){plan['start_addr']}U, (uint16_t){plan['reg_count']}U);"
+        )
         c_lines.append("}")
         c_lines.append("")
 
@@ -1112,7 +1233,10 @@ def write_modbus_crc_util(out_dir):
     with open(os.path.join(out_dir, "modbus_crc_util.c"), "w", encoding="utf-8") as f:
         f.write("\n".join(c_lines))
 
-def write_modbus_sender_gen_h(out_dir, entries):
+def write_modbus_sender_gen_h(out_dir, entries, read_plans=None):
+    if read_plans is None:
+        read_plans = []
+
     h_lines = [
         "#ifndef MODBUS_SENDER_GEN_H",
         "#define MODBUS_SENDER_GEN_H",
@@ -1127,6 +1251,9 @@ def write_modbus_sender_gen_h(out_dir, entries):
     for e in entries:
         h_lines.append(f"void modbus_sender_set_{e['name']}(void);")
         h_lines.append(f"void modbus_sender_req_{e['name']}(void);")
+
+    for plan in read_plans:
+        h_lines.append(f"void modbus_sender_req_group_{plan['func_suffix']}(void);")
 
     h_lines.append("")
     h_lines.append("uint16_t modbus_sender_get_last_read_addr(void);")
@@ -1148,6 +1275,7 @@ def main():
     reg_table_df = pd.read_excel(file_path, sheet_name="RegisterTable", header=None)
     lengthdefs_df = pd.read_excel(file_path, sheet_name="LengthDefs", header=None)
     modbus_slave_addr = read_modbus_slave_addr(file_path)
+    read_plans = read_read_plan(file_path)
 
     header_row_index = None
     for i, row in reg_table_df.iterrows():
@@ -1236,8 +1364,8 @@ def main():
     write_modbus_reg_edge_master_c(out_dir, entries)
     write_modbus_reply_handler_master_h(out_dir)
     write_modbus_reply_handler_master_c(out_dir, entries)
-    write_modbus_sender_gen_h(out_dir, entries)
-    write_modbus_sender_gen_c(os.path.join(out_dir, "modbus_sender_gen.c"), entries)
+    write_modbus_sender_gen_h(out_dir, entries, read_plans)
+    write_modbus_sender_gen_c(os.path.join(out_dir, "modbus_sender_gen.c"), entries, read_plans)
     write_modbus_sender_generic(out_dir)
     write_modbus_crc_util(out_dir)
 
