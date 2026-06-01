@@ -161,9 +161,9 @@ def read_read_plan(excel_path: str) -> list:
 
         group_cell = row[2] if 2 in row.index else pd.NA
         addr_cell = row[3] if 3 in row.index else pd.NA
-        count_cell = row[4] if 4 in row.index else pd.NA
+        end_addr_cell = row[4] if 4 in row.index else pd.NA
 
-        if pd.isna(group_cell) and pd.isna(addr_cell) and pd.isna(count_cell):
+        if pd.isna(group_cell) and pd.isna(addr_cell) and pd.isna(end_addr_cell):
             continue
 
         group_name = str(group_cell).strip() if pd.notna(group_cell) else ""
@@ -173,17 +173,26 @@ def read_read_plan(excel_path: str) -> list:
 
         try:
             start_addr = _parse_int_auto_base(addr_cell)
-            reg_count = _parse_int_auto_base(count_cell)
+            end_addr = _parse_int_auto_base(end_addr_cell)
         except ValueError:
-            print(f"Warning: ReadPlan row {i + 1} has invalid StartAddr/RegCount. Skipping.")
+            print(f"Warning: ReadPlan row {i + 1} has invalid StartAddr/endAddr. Skipping.")
             continue
 
         if not (0 <= start_addr <= 0xFFFF):
             print(f"Warning: ReadPlan row {i + 1} StartAddr '{start_addr}' is out of range (0..65535). Skipping.")
             continue
 
+        if not (0 <= end_addr <= 0xFFFF):
+            print(f"Warning: ReadPlan row {i + 1} endAddr '{end_addr}' is out of range (0..65535). Skipping.")
+            continue
+
+        if end_addr < start_addr:
+            print(f"Warning: ReadPlan row {i + 1} endAddr '{end_addr}' is smaller than StartAddr '{start_addr}'. Skipping.")
+            continue
+
+        reg_count = end_addr - start_addr + 1
         if not (1 <= reg_count <= 125):
-            print(f"Warning: ReadPlan row {i + 1} RegCount '{reg_count}' is out of range (1..125). Skipping.")
+            print(f"Warning: ReadPlan row {i + 1} register range '{reg_count}' is out of range (1..125). Skipping.")
             continue
 
         suffix_base = sanitize_c_identifier(group_name, default_prefix="group")
