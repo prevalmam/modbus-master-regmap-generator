@@ -37,6 +37,20 @@ def sanitize_c_identifier(raw_name: str, default_prefix: str = "group") -> str:
     return sanitized.lower()
 
 
+def sanitize_c_function_suffix(raw_name: str, default_suffix: str = "unnamed") -> str:
+    text = str(raw_name).strip()
+    if text == "":
+        return default_suffix
+
+    sanitized = re.sub(r"[^0-9A-Za-z_]", "_", text)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+
+    if sanitized == "":
+        return default_suffix
+
+    return sanitized.lower()
+
+
 def resolve_length(length_cell, length_defs: dict) -> int:
     if pd.isna(length_cell):
         return 1
@@ -214,6 +228,153 @@ def read_read_plan(excel_path: str) -> list:
         })
 
     return plans
+
+def read_write_plan(excel_path: str):
+    try:
+        write_plan_df = pd.read_excel(excel_path, sheet_name="WritePlan", header=None)
+    except Exception as exc:
+        print(f"Info: WritePlan sheet was not loaded ({exc}). Group write requests will not be generated.")
+        return []
+
+    header_row_index = None
+    for i, row in write_plan_df.iterrows():
+        if str(row[2] if 2 in row.index else "").strip() == "GroupName":
+            header_row_index = i
+            break
+
+    if header_row_index is None:
+        print("Error: WritePlan header 'GroupName' was not found in column C.")
+        return None
+
+    plans = []
+    errors = []
+    used_suffixes = set()
+
+    for i in range(header_row_index + 1, len(write_plan_df)):
+        row = write_plan_df.iloc[i]
+
+        if str(row[1] if 1 in row.index else "").strip().upper() == "EOF":
+            break
+
+        group_cell = row[2] if 2 in row.index else pd.NA
+        addr_cell = row[3] if 3 in row.index else pd.NA
+        end_addr_cell = row[4] if 4 in row.index else pd.NA
+
+        if pd.isna(group_cell) and pd.isna(addr_cell) and pd.isna(end_addr_cell):
+            continue
+
+        group_name = str(group_cell).strip() if pd.notna(group_cell) else ""
+        if group_name == "":
+            errors.append(f"WritePlan row {i + 1} has empty GroupName.")
+            continue
+
+        try:
+            start_addr = _parse_int_auto_base(addr_cell)
+            end_addr = _parse_int_auto_base(end_addr_cell)
+        except ValueError:
+            errors.append(f"WritePlan row {i + 1} has invalid StartAddr/endAddr.")
+            continue
+
+        if not (0 <= start_addr <= 0xFFFF):
+            errors.append(f"WritePlan row {i + 1} StartAddr '{start_addr}' is out of range (0..65535).")
+            continue
+
+        if not (0 <= end_addr <= 0xFFFF):
+            errors.append(f"WritePlan row {i + 1} endAddr '{end_addr}' is out of range (0..65535).")
+            continue
+
+        if end_addr < start_addr:
+            errors.append(f"WritePlan row {i + 1} endAddr '{end_addr}' is smaller than StartAddr '{start_addr}'.")
+            continue
+
+        reg_count = end_addr - start_addr + 1
+        if not (1 <= reg_count <= 123):
+            errors.append(f"WritePlan row {i + 1} register range '{reg_count}' is out of range (1..123).")
+            continue
+
+        suffix_base = sanitize_c_function_suffix(group_name)
+        suffix = suffix_base
+        duplicate_index = 2
+        while suffix in used_suffixes:
+            suffix = f"{suffix_base}_{duplicate_index}"
+            duplicate_index += 1
+
+        if suffix != suffix_base:
+            print(f"Warning: WritePlan group '{group_name}' was duplicated. Using function suffix '{suffix}'.")
+
+        used_suffixes.add(suffix)
+        plans.append({
+            "group_name": group_name,
+            "func_suffix": suffix,
+            "start_addr": int(start_addr),
+            "reg_count": int(reg_count),
+        })
+
+    if errors:
+        for error in errors:
+            print(f"Error: {error}")
+        return None
+
+    return plans
+
+
+def validate_write_plans(write_plans: list, entries: list):
+    if not write_plans:
+        return []
+
+    errors = []
+    addr_to_entry = {}
+    entry_spans = []
+
+    for entry in entries:
+        start_addr = int(entry["modbus_addr"])
+        reg_count = get_register_count(entry["type"], int(entry["length"]))
+        end_addr = start_addr + reg_count - 1
+        entry_spans.append((entry, start_addr, end_addr))
+
+        for addr in range(start_addr, end_addr + 1):
+            if addr in addr_to_entry:
+                prev_entry = addr_to_entry[addr]
+                errors.append(
+                    f"RegisterTable address {addr} is defined by both '{prev_entry['name']}' and '{entry['name']}'."
+                )
+            else:
+                addr_to_entry[addr] = entry
+
+    validated_plans = []
+
+    for plan in write_plans:
+        start_addr = int(plan["start_addr"])
+        end_addr = start_addr + int(plan["reg_count"]) - 1
+        segments = []
+
+        for entry, entry_start, entry_end in entry_spans:
+            if entry_end < start_addr or end_addr < entry_start:
+                continue
+
+            if entry_start < start_addr or entry_end > end_addr:
+                errors.append(
+                    f"WritePlan group '{plan['group_name']}' cuts through RegisterTable entry "
+                    f"'{entry['name']}' ({entry_start}..{entry_end})."
+                )
+                continue
+
+            segments.append(entry)
+
+        for addr in range(start_addr, end_addr + 1):
+            if addr not in addr_to_entry:
+                errors.append(f"WritePlan group '{plan['group_name']}' has undefined address {addr}.")
+
+        enriched_plan = dict(plan)
+        enriched_plan["segments"] = sorted(segments, key=lambda entry: int(entry["modbus_addr"]))
+        validated_plans.append(enriched_plan)
+
+    if errors:
+        for error in errors:
+            print(f"Error: {error}")
+        return None
+
+    return validated_plans
 
 def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
     c_lines = [
@@ -1009,9 +1170,11 @@ def write_modbus_reg_map_master_c(out_dir, entries):
         f.write("\n".join(c_lines))
 
 
-def write_modbus_sender_gen_c(c_path, entries, read_plans=None):
+def write_modbus_sender_gen_c(c_path, entries, read_plans=None, write_plans=None):
     if read_plans is None:
         read_plans = []
+    if write_plans is None:
+        write_plans = []
     c_lines = [
         '#include "modbus_sender_gen.h"',
         '#include "modbus_sender_generic.h"',
@@ -1038,6 +1201,30 @@ def write_modbus_sender_gen_c(c_path, entries, read_plans=None):
         '    modbus_sender_output(frame, modbus_append_crc(frame, pos));',
         '    s_last_read_addr = start_addr;',
         '    s_last_read_regs = reg_count;',
+        '}',
+        '',
+        'static void modbus_sender_send_write_registers(uint16_t start_addr, const uint16_t *regs, uint16_t reg_count)',
+        '{',
+        '    uint8_t *frame = s_modbus_frame_buf;',
+        '    uint16_t pos = 0;',
+        '    uint16_t i;',
+        '',
+        '    if ((regs == (const uint16_t *)0) || (reg_count == 0U) || (reg_count > 123U)) return;',
+        '',
+        '    frame[pos++] = MODBUS_SLAVE_ADDR;',
+        '    frame[pos++] = 0x10;',
+        '    frame[pos++] = (uint8_t)(start_addr >> 8U);',
+        '    frame[pos++] = (uint8_t)(start_addr & 0xFFU);',
+        '    frame[pos++] = (uint8_t)(reg_count >> 8U);',
+        '    frame[pos++] = (uint8_t)(reg_count & 0xFFU);',
+        '    frame[pos++] = (uint8_t)(reg_count * 2U);',
+        '',
+        '    for (i = 0U; i < reg_count; ++i) {',
+        '        frame[pos++] = (uint8_t)(regs[i] >> 8U);',
+        '        frame[pos++] = (uint8_t)(regs[i] & 0xFFU);',
+        '    }',
+        '',
+        '    modbus_sender_output(frame, modbus_append_crc(frame, pos));',
         '}',
         ''
     ]
@@ -1070,7 +1257,55 @@ def write_modbus_sender_gen_c(c_path, entries, read_plans=None):
         c_lines.append("}")
         c_lines.append("")
 
-    # ✅ getter関数の追加
+    # group write functions
+    for plan in write_plans:
+        uses_float = any("FLOAT" in entry["type"] for entry in plan["segments"])
+        c_lines.append(f"void modbus_sender_set_group_{plan['func_suffix']}(void)")
+        c_lines.append("{")
+        c_lines.append(f"    uint16_t regs[{plan['reg_count']}U];")
+        if uses_float:
+            c_lines.append("    union { float f; uint32_t u; } conv;")
+        c_lines.append("")
+
+        for entry in plan["segments"]:
+            base = f"g_reg_table_master[MODBUS_IDX_{entry['name']}]"
+            offset = int(entry["modbus_addr"]) - int(plan["start_addr"])
+            entry_type = entry["type"]
+            length = int(entry["length"])
+
+            if "UINT16" in entry_type:
+                for index in range(length):
+                    reg_offset = offset + index
+                    c_lines.append(
+                        f"    regs[{reg_offset}U] = ((const uint16_t *){base}.ram_ptr)[{index}U];"
+                    )
+            elif "UINT32" in entry_type:
+                for index in range(length):
+                    reg_offset = offset + (index * 2)
+                    c_lines.append("    {")
+                    c_lines.append(
+                        f"        const uint32_t value = ((const uint32_t *){base}.ram_ptr)[{index}U];"
+                    )
+                    c_lines.append(f"        regs[{reg_offset}U] = (uint16_t)(value >> 16U);")
+                    c_lines.append(f"        regs[{reg_offset + 1}U] = (uint16_t)(value & 0xFFFFU);")
+                    c_lines.append("    }")
+            elif "FLOAT" in entry_type:
+                for index in range(length):
+                    reg_offset = offset + (index * 2)
+                    c_lines.append("    {")
+                    c_lines.append(f"        conv.f = ((const float *){base}.ram_ptr)[{index}U];")
+                    c_lines.append(f"        regs[{reg_offset}U] = (uint16_t)(conv.u >> 16U);")
+                    c_lines.append(f"        regs[{reg_offset + 1}U] = (uint16_t)(conv.u & 0xFFFFU);")
+                    c_lines.append("    }")
+
+        c_lines.append("")
+        c_lines.append(
+            f"    modbus_sender_send_write_registers((uint16_t){plan['start_addr']}U, regs, (uint16_t){plan['reg_count']}U);"
+        )
+        c_lines.append("}")
+        c_lines.append("")
+
+    # getter functions
     c_lines.extend([
         'uint16_t modbus_sender_get_last_read_addr(void)',
         '{',
@@ -1242,9 +1477,11 @@ def write_modbus_crc_util(out_dir):
     with open(os.path.join(out_dir, "modbus_crc_util.c"), "w", encoding="utf-8") as f:
         f.write("\n".join(c_lines))
 
-def write_modbus_sender_gen_h(out_dir, entries, read_plans=None):
+def write_modbus_sender_gen_h(out_dir, entries, read_plans=None, write_plans=None):
     if read_plans is None:
         read_plans = []
+    if write_plans is None:
+        write_plans = []
 
     h_lines = [
         "#ifndef MODBUS_SENDER_GEN_H",
@@ -1263,6 +1500,9 @@ def write_modbus_sender_gen_h(out_dir, entries, read_plans=None):
 
     for plan in read_plans:
         h_lines.append(f"void modbus_sender_req_group_{plan['func_suffix']}(void);")
+
+    for plan in write_plans:
+        h_lines.append(f"void modbus_sender_set_group_{plan['func_suffix']}(void);")
 
     h_lines.append("")
     h_lines.append("uint16_t modbus_sender_get_last_read_addr(void);")
@@ -1285,6 +1525,9 @@ def main():
     lengthdefs_df = pd.read_excel(file_path, sheet_name="LengthDefs", header=None)
     modbus_slave_addr = read_modbus_slave_addr(file_path)
     read_plans = read_read_plan(file_path)
+    write_plans = read_write_plan(file_path)
+    if write_plans is None:
+        return
 
     header_row_index = None
     for i, row in reg_table_df.iterrows():
@@ -1362,6 +1605,10 @@ def main():
     for entry in entries:
         entry["modbus_addr"] = entry["addr"]  # map_master.c側で必要になるので補完
 
+    write_plans = validate_write_plans(write_plans, entries)
+    if write_plans is None:
+        return
+
     out_dir = os.path.dirname(file_path)
 
     write_modbus_reg_map_master_h(out_dir, entries, length_defs)
@@ -1373,8 +1620,8 @@ def main():
     write_modbus_reg_edge_master_c(out_dir, entries)
     write_modbus_reply_handler_master_h(out_dir)
     write_modbus_reply_handler_master_c(out_dir, entries)
-    write_modbus_sender_gen_h(out_dir, entries, read_plans)
-    write_modbus_sender_gen_c(os.path.join(out_dir, "modbus_sender_gen.c"), entries, read_plans)
+    write_modbus_sender_gen_h(out_dir, entries, read_plans, write_plans)
+    write_modbus_sender_gen_c(os.path.join(out_dir, "modbus_sender_gen.c"), entries, read_plans, write_plans)
     write_modbus_sender_generic(out_dir)
     write_modbus_crc_util(out_dir)
 
