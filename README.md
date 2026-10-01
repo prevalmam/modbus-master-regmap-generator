@@ -192,7 +192,7 @@ void poll_uptime_sec(void)
 #### 4.3.2 Write Request（0x10）
 
 - アプリ側で RAM 上の値を setter で更新したあと、`modbus_sender_set_<VarName>()` を呼び出すと Function Code 0x10（Write Multiple Registers）が組み立てられます。
-- データ型ごとに `modbus_sender_generic_u16/u32/float()` が内部で選択され、必要なバイト長や配列展開をすべて自動で行います。
+- データ型ごとに `modbus_sender_generic_u16/u32/float/string()` が内部で選択され、必要なバイト長や配列展開をすべて自動で行います。
 - 配列レジスタの場合もブロック全体を 1 パケットで送るのが基本です。
 
 ```c
@@ -237,7 +237,26 @@ void update_device_mode(uint16_t new_value)
 
 なお、setter は min/max チェックを自動で行います。 範囲外の値をセットしようとした場合は何も変更されません。
 
-#### 4.5.3 下限値・上限値の取得
+#### 4.5.3 固定長文字列のアクセス
+
+`Type` が `string` または `CHAR` のレジスタには、NUL終端を保証するcopy getterと、ASCII文字列用setterが生成されます。
+
+```c
+char name[MODBUS_MASTER_device_name_BUFFER_SIZE];
+
+if (get_master_device_name_copy(name, sizeof(name)) != 0)
+{
+    /* name はNUL終端済み */
+}
+
+set_master_device_name("SENSOR-A");
+```
+
+固定長フィールドが最大長まで使われている場合、内部RAMには終端NULがありません。内部RAMを直接 `strlen()`、`strcmp()`、`printf("%s", ...)` へ渡さず、生成されたcopy getterを使用してください。
+
+文字列全体の変化検出には `detect_master_<VarName>_changed()` が生成されます。`modbus_reg_edge_master_init()` は現在値を初期状態として取り込みます。
+
+#### 4.5.4 下限値・上限値の取得
 
     uint16_t min_mode = get_master_device_mode_min();
     uint16_t max_mode = get_master_device_mode_max();
@@ -284,13 +303,29 @@ void update_device_mode(uint16_t new_value)
 |------|------------|-------------------------------------------|
 | `Reg_Addr` | `1000` | Modbus アドレス(10進数) |
 | `VarName` | `device_mode` | レジスタの論理名（C 変数名にも使用） |
-| `Type` | `uint16_t` / `uint32_t` / `float` | 型（C コード生成に利用） |
+| `Type` | `uint16_t` / `uint32_t` / `float` / `string` / `CHAR` | 型（C コード生成に利用） |
 | `ArrayLen` | `1` / `NUM_DISCRETE_INPUTS` | 配列長。複数の場合は連続アドレスを自動展開 |
 | `Min` | `0` | 許容最小値（境界チェックで使用） |
 | `Max` | `3` | 許容最大値（境界チェックで使用） |
 | `Default` | `0` | 初期値 |
 
 ![入力 Excel のフォーマット例](images/format.png)
+
+##### 文字列レジスタ
+
+文字列は `ArrayLen` byteの固定長フィールドとして扱います。Modbus上では1 registerに2 byteずつ、high byte → low byteの順で格納します。
+
+| Reg_Addr | VarName | Type | ArrayLen | Min | Max | Default |
+|---------:|---------|------|---------:|-----|-----|---------|
+| `1000` | `device_name` | `string` | `16` | `-` | `-` | `SENSOR-A` |
+
+- `Type` は `string` または `CHAR` を指定します。
+- `ArrayLen` は2～246の偶数とします。これは固定長フィールドのbyte数であり、設定可能な最大文字数でもあります。
+- 文字数が `ArrayLen` 未満の場合は後ろを `0x00` で埋めます。ちょうど `ArrayLen` の場合はフィールド内に終端NULを格納しません。
+- `Default` はASCII printable文字のみ指定できます。空文字列は `-`、リテラルの `-` は `"-"` と指定します。
+- `Min` と `Max` は `-` を指定します。
+- 246 byteの上限は、Function Code 0x10の最大123 registersに合わせたものです。
+- 受信時は「ASCII printable文字＋`0x00` padding」、または全byteがASCII printable文字の最大長フィールドだけをRAMへ反映します。
 
 ※プロジェクトに応じて追加カラムは自由に拡張できます。  
 
@@ -317,6 +352,8 @@ Config シートの C 列で `SLAVE_ADDR` と記載された行を探し、そ�
 
 本ツール実行後、選択した Excel と同じフォルダに以下の C/C ヘッダファイル群が出力されます。
 
+生成ファイルはUTF-8（BOMなし）、LF改行で出力します。文字列フィールドの公開ヘルパーは `modbus_master_string_field_length()` / `modbus_master_string_field_is_valid()` とし、slave側の同名ヘルパーとのリンク時の衝突を避けます。
+
 #### 5.2.1.レジスタ定義・アクセサ
 | ファイル | 役割 |
 |---------|--------------------------------------------|
@@ -341,7 +378,7 @@ Config シートの C 列で `SLAVE_ADDR` と記載された行を探し、そ�
 | ファイル | 役割 |
 |---------|--------------------------------------------|
 | `modbus_sender_gen.c/h` | 各レジスタブロックごとの read request / write set ラッパー、直近リード範囲の保持 |
-| `modbus_sender_generic.c/h` | write multiple registers 用の型別共通送信関数（uint16/uint32/float） |
+| `modbus_sender_generic.c/h` | write multiple registers 用の型別共通送信関数（uint16/uint32/float/string） |
 
 #### 5.2.5.共通ユーティリティ
 

@@ -6,10 +6,77 @@ import re
 import textwrap
 
 DEFAULT_MODBUS_SLAVE_ADDR = 1  # Configシート未設定時のフォールバック値
+MODBUS_MAX_WRITE_REGISTERS = 123
+MODBUS_MAX_STRING_BYTES = MODBUS_MAX_WRITE_REGISTERS * 2
+
+
+def normalize_master_type(var_type: str) -> str:
+    """Normalize and validate an Excel Type value."""
+    normalized = str(var_type).strip().lower()
+    if normalized in ("string", "char"):
+        return "string"
+    if normalized in ("uint16_t", "uint32_t", "float"):
+        return normalized
+    raise ValueError(
+        f"unsupported Type '{var_type}'. "
+        "Use uint16_t, uint32_t, float, string, or CHAR."
+    )
+
+
+def is_string_type(var_type: str) -> bool:
+    return normalize_master_type(var_type) == "string"
+
+
+def resolve_string_default(raw_value) -> str:
+    if pd.isna(raw_value) or str(raw_value).strip() == "":
+        raise ValueError("string Default must not be blank. Use '-' for an empty string.")
+
+    value = str(raw_value)
+    if value == "-":
+        return ""
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    return value
+
+
+def validate_string_entry(length: int, min_value, max_value, default_value) -> str:
+    if length < 2:
+        raise ValueError(f"string ArrayLen must be at least 2, got {length}.")
+    if (length % 2) != 0:
+        raise ValueError(f"string ArrayLen must be even, got {length}.")
+    if length > MODBUS_MAX_STRING_BYTES:
+        raise ValueError(
+            f"string ArrayLen must be {MODBUS_MAX_STRING_BYTES} bytes or less, got {length}."
+        )
+    if pd.isna(min_value) or str(min_value).strip() != "-":
+        raise ValueError("string Min must be '-'.")
+    if pd.isna(max_value) or str(max_value).strip() != "-":
+        raise ValueError("string Max must be '-'.")
+
+    default_text = resolve_string_default(default_value)
+    if len(default_text) > length:
+        raise ValueError(
+            f"string Default length must be {length} bytes or less, got {len(default_text)}."
+        )
+    for char in default_text:
+        code = ord(char)
+        if code < 0x20 or code > 0x7E:
+            raise ValueError("string Default must contain ASCII printable characters only.")
+    return default_text
+
+
+def format_string_field_initializer(value: str, field_size: int) -> str:
+    encoded = [ord(char) for char in value]
+    if len(encoded) > field_size:
+        raise ValueError("string value exceeds fixed field size")
+    encoded.extend([0] * (field_size - len(encoded)))
+    return "{" + ", ".join(f"0x{byte:02X}" for byte in encoded) + "}"
 
 # 1レジスタ = 2バイト前提で、型に応じたレジスタ数を計算（未使用）（g_reg_table の size を参照）
 def get_register_count(entry_type: str, length: int) -> int:
-    if "UINT16" in entry_type:
+    if "STRING" in entry_type:
+        return length // 2
+    elif "UINT16" in entry_type:
         return length
     elif "UINT32" in entry_type or "FLOAT" in entry_type:
         return length * 2
@@ -528,8 +595,21 @@ def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
         '                }',
         '                break;',
         '            }',
-        '            default:',
+        '            case REG_TYPE_MASTER_STRING: {',
+        '                uint16_t required_bytes;',
+        '',
+        '                required_bytes = entry->length;',
+        '                if ((offset + required_bytes) > byte_count) return -1;',
+        '                if (modbus_master_string_field_is_valid(',
+        '                        (const char *)&data[offset], required_bytes) == 0) return -1;',
+        '                if (memcmp(dst, &data[offset], required_bytes) != 0)',
+        '                {',
+        '                    (void)memcpy(dst, &data[offset], required_bytes);',
+        '                }',
         '                break;',
+        '            }',
+        '            default:',
+        '                return -1;',
         '        }',
         '    }',
         '    return 0;',
@@ -564,7 +644,7 @@ def write_modbus_reply_handler_master_c(out_dir: str, entries: list):
         '}'
     ]
 
-    with open(os.path.join(out_dir, "modbus_reply_handler_master.c"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reply_handler_master.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 
@@ -580,16 +660,19 @@ def write_modbus_reply_handler_master_h(out_dir: str):
         "#endif"
     ]
 
-    with open(os.path.join(out_dir, "modbus_reply_handler_master.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reply_handler_master.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
 
 def write_modbus_reg_edge_master_c(out_dir, entries):
+    has_string = any(entry["type"] == "REG_TYPE_MASTER_STRING" for entry in entries)
     c_lines = [
         '#include "modbus_reg_access_master.h"',
         '#include "modbus_reg_idx_master.h"',
         '#include "modbus_reg_edge_master.h"',
-        '',
     ]
+    if has_string:
+        c_lines.append('#include <string.h>')
+    c_lines.append('')
 
     has_float = any("FLOAT" in entry["type"] for entry in entries)
     if has_float:
@@ -614,7 +697,28 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
         is_array = entry["length"] > 1
         length = entry["length"]
 
-        if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
+        if entry_type == "REG_TYPE_MASTER_STRING":
+            c_lines.extend([
+                f"int detect_master_{name}_changed(void)",
+                "{",
+                f"    static char prev[{length}];",
+                f"    char curr[{length + 1}];",
+                "",
+                "    (void)memset(curr, 0, sizeof(curr));",
+                f"    if (get_master_{name}_copy(curr, (uint16_t)sizeof(curr)) == 0)",
+                "    {",
+                "        return 0;",
+                "    }",
+                f"    if (memcmp(prev, curr, {length}U) != 0)",
+                "    {",
+                f"        (void)memcpy(prev, curr, {length}U);",
+                "        return 1;",
+                "    }",
+                "    return 0;",
+                "}",
+            ])
+
+        elif entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
             c_lines.extend([
                 f"int detect_master_{name}_changed(void)",
                 "{",
@@ -743,7 +847,14 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
     c_lines.append("{")
 
     # 🔽 配列エントリが存在するかチェック
-    has_array_entries = any(entry["length"] > 1 for entry in entries)
+    has_array_entries = any(
+        entry["type"] in (
+            "REG_TYPE_MASTER_UINT16_ARRAY",
+            "REG_TYPE_MASTER_UINT32_ARRAY",
+            "REG_TYPE_MASTER_FLOAT_ARRAY",
+        )
+        for entry in entries
+    )
 
     if has_array_entries:    
         c_lines.append("    uint16_t i = 0;")
@@ -756,7 +867,9 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
         is_array = entry["length"] > 1
         length = entry["length"]
 
-        if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
+        if entry_type == "REG_TYPE_MASTER_STRING":
+            c_lines.append(f"    (void)detect_master_{name}_changed();")
+        elif entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
             c_lines.append(f"    (void)detect_master_{name}_changed();")
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
             mask_literal = "0xFFFFFFFFUL" if entry_type == "REG_TYPE_MASTER_UINT32" else "0xFFFFU"
@@ -772,7 +885,7 @@ def write_modbus_reg_edge_master_c(out_dir, entries):
             c_lines.append(f"    for (i = 0; i < {length}U; ++i) (void)detect_master_{name}_any_changed();")
     c_lines.append("}")
 
-    with open(os.path.join(out_dir, "modbus_reg_edge_master.c"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_edge_master.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 def write_modbus_reg_edge_master_h(out_dir, entries):
@@ -790,7 +903,10 @@ def write_modbus_reg_edge_master_h(out_dir, entries):
         entry_type = entry["type"]
         is_array = entry["length"] > 1
 
-        if entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
+        if entry_type == "REG_TYPE_MASTER_STRING":
+            h_lines.append(f"int detect_master_{name}_changed(void);")
+
+        elif entry_type == "REG_TYPE_MASTER_FLOAT" and not is_array:
             h_lines.append(f"int detect_master_{name}_changed(void);")
 
         elif entry_type in ("REG_TYPE_MASTER_UINT16", "REG_TYPE_MASTER_UINT32") and not is_array:
@@ -811,16 +927,19 @@ def write_modbus_reg_edge_master_h(out_dir, entries):
     h_lines.append("")
     h_lines.append("#endif")
 
-    with open(os.path.join(out_dir, "modbus_reg_edge_master.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_edge_master.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
 
 def write_modbus_reg_access_master_c(out_dir, entries):
+    has_string = any(entry["type"] == "REG_TYPE_MASTER_STRING" for entry in entries)
     c_lines = [
         '#include "modbus_reg_access_master.h"',
         '#include "modbus_reg_map_master.h"',
         '#include "modbus_reg_idx_master.h"',
-        '',
     ]
+    if has_string:
+        c_lines.append('#include <string.h>')
+    c_lines.append('')
 
     used_types = {e["raw_var_type"] for e in entries}
 
@@ -828,6 +947,49 @@ def write_modbus_reg_access_master_c(out_dir, entries):
         '/* Access function implementations */',    
         '',
     ])
+
+    if has_string:
+        c_lines.extend([
+            'static uint16_t string_length_limited(const char *value, uint16_t max_size)',
+            '{',
+            '    uint16_t length = 0U;',
+            '',
+            '    if (value == (const char *)0)',
+            '    {',
+            '        return max_size;',
+            '    }',
+            '    while ((length < max_size) && (value[length] != \'\\0\'))',
+            '    {',
+            '        ++length;',
+            '    }',
+            '    return length;',
+            '}',
+            '',
+            'static int is_valid_string_value(const char *value, uint16_t max_chars)',
+            '{',
+            '    uint16_t i;',
+            '    unsigned char ch;',
+            '',
+            '    if ((value == (const char *)0) || (max_chars == 0U))',
+            '    {',
+            '        return 0;',
+            '    }',
+            '    for (i = 0U; i < max_chars; ++i)',
+            '    {',
+            '        ch = (unsigned char)value[i];',
+            '        if (ch == \'\\0\')',
+            '        {',
+            '            return 1;',
+            '        }',
+            '        if ((ch < 0x20U) || (ch > 0x7EU))',
+            '        {',
+            '            return 0;',
+            '        }',
+            '    }',
+            '    return value[max_chars] == \'\\0\';',
+            '}',
+            '',
+        ])
 
     if "uint16_t" in used_types:
         c_lines.extend([    
@@ -886,12 +1048,51 @@ def write_modbus_reg_access_master_c(out_dir, entries):
 
     for entry in entries:
         name = entry["name"]
+        entry_ref = f"g_reg_table_master[MODBUS_IDX_{name}]"
+
+        if entry["type"] == "REG_TYPE_MASTER_STRING":
+            length = entry["length"]
+            c_lines.extend([
+                f"int get_master_{name}_copy(char *dst, uint16_t dst_size)",
+                "{",
+                f"    const char *src = (const char *)({entry_ref}.ram_ptr);",
+                f"    const uint16_t len = modbus_master_string_field_length(src, {length}U);",
+                "",
+                "    if ((dst == (char *)0) || (dst_size <= len))",
+                "    {",
+                "        return 0;",
+                "    }",
+                "    (void)memcpy(dst, src, len);",
+                "    dst[len] = '\\0';",
+                "    return 1;",
+                "}",
+                "",
+                f"int set_master_{name}(const char *value)",
+                "{",
+                f"    char temp[{length}];",
+                f"    char * const ram = (char *)({entry_ref}.ram_ptr);",
+                f"    const uint16_t len = string_length_limited(value, {length + 1}U);",
+                "",
+                f"    if (is_valid_string_value(value, {length}U) == 0)",
+                "    {",
+                "        return 0;",
+                "    }",
+                "    (void)memset(temp, 0, sizeof(temp));",
+                "    (void)memcpy(temp, value, len);",
+                "    if (memcmp(ram, temp, sizeof(temp)) != 0)",
+                "    {",
+                "        (void)memcpy(ram, temp, sizeof(temp));",
+                "    }",
+                "    return 1;",
+                "}",
+                "",
+            ])
+            continue
+
         base_type = get_base_type(entry["type"])
         read_func = get_read_func(entry["type"])
         write_func = get_write_func(entry["type"])
         is_array = entry["length"] > 1
-
-        entry_ref = f"g_reg_table_master[MODBUS_IDX_{name}]"
 
         # get
         if is_array:
@@ -951,7 +1152,7 @@ def write_modbus_reg_access_master_c(out_dir, entries):
 
         c_lines.append("")
 
-    with open(os.path.join(out_dir, "modbus_reg_access_master.c"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_access_master.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 def write_modbus_reg_access_master_h(out_dir, entries):
@@ -976,6 +1177,19 @@ def write_modbus_reg_access_master_h(out_dir, entries):
 
     for entry in entries:
         name = entry["name"]
+        if entry["type"] == "REG_TYPE_MASTER_STRING":
+            h_lines.append(f"#define MODBUS_MASTER_{name}_MAX_LENGTH  ({entry['length']}U)")
+            h_lines.append(
+                f"#define MODBUS_MASTER_{name}_BUFFER_SIZE "
+                f"(MODBUS_MASTER_{name}_MAX_LENGTH + 1U)"
+            )
+            h_lines.append(
+                f"int get_master_{name}_copy(char *dst, uint16_t dst_size);"
+            )
+            h_lines.append(f"int set_master_{name}(const char *value);")
+            h_lines.append("")
+            continue
+
         base_type = get_base_type(entry["type"])
         is_array = entry["length"] > 1
 
@@ -995,7 +1209,7 @@ def write_modbus_reg_access_master_h(out_dir, entries):
 
     h_lines.append("#endif")
 
-    with open(os.path.join(out_dir, "modbus_reg_access_master.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_access_master.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
 
 def write_modbus_reg_idx_master_h(out_dir, entries, slave_addr):
@@ -1016,7 +1230,7 @@ def write_modbus_reg_idx_master_h(out_dir, entries, slave_addr):
 
         idx_lines.append(f"#define MODBUS_IDX_{base_name}  ({idx})")
 
-        if length > 1:
+        if length > 1 and entry["type"] != "REG_TYPE_MASTER_STRING":
             for i in range(length):
                 idx_lines.append(f"#define MODBUS_IDX_{base_name}_{i}  ({i})")
 
@@ -1025,21 +1239,23 @@ def write_modbus_reg_idx_master_h(out_dir, entries, slave_addr):
     idx_lines.append("")
     idx_lines.append("#endif")
 
-    with open(os.path.join(out_dir, "modbus_reg_idx_master.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_idx_master.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(idx_lines))
 
 def map_type_master(var_type: str, is_array: bool) -> str:
-    vt = var_type.strip().lower()
+    vt = normalize_master_type(var_type)
+    if vt == "string":
+        return "REG_TYPE_MASTER_STRING"
     if vt == "uint16_t":
         return "REG_TYPE_MASTER_UINT16_ARRAY" if is_array else "REG_TYPE_MASTER_UINT16"
     elif vt == "uint32_t":
         return "REG_TYPE_MASTER_UINT32_ARRAY" if is_array else "REG_TYPE_MASTER_UINT32"
     elif vt == "float":
         return "REG_TYPE_MASTER_FLOAT_ARRAY" if is_array else "REG_TYPE_MASTER_FLOAT"
-    else:
-        return "REG_TYPE_MASTER_UINT16"
+    raise ValueError(f"unsupported Type '{var_type}'.")
 
 def format_value_for_init(var_type: str, value: str) -> str:
+    var_type = normalize_master_type(var_type)
     try:
         if value.strip() == "":
             value = "0"
@@ -1056,6 +1272,11 @@ def format_value_for_init(var_type: str, value: str) -> str:
         return "0"
 
 def generate_static_definition(var_type: str, var_name: str, count: int, default_str: str) -> str:
+    var_type = normalize_master_type(var_type)
+    if var_type == "string":
+        initializer = format_string_field_initializer(default_str, count)
+        return f"static char {var_name}[{count}] = {initializer};"
+
     init_val = format_value_for_init(var_type, default_str)
     if count == 1:
         return f"static {var_type} {var_name} = {init_val};"
@@ -1065,7 +1286,9 @@ def generate_static_definition(var_type: str, var_name: str, count: int, default
 
 def get_generic_func_call(var_type: str, base: str) -> str:
     type_lower = var_type.lower()
-    if "uint16" in type_lower:
+    if "string" in type_lower:
+        return f"modbus_sender_generic_string((const char *){base}.ram_ptr, {base}.modbus_addr, {base}.length);"
+    elif "uint16" in type_lower:
         return f"modbus_sender_generic_u16((const uint16_t *){base}.ram_ptr, {base}.modbus_addr, {base}.length);"
     elif "uint32" in type_lower:
         return f"modbus_sender_generic_u32((const uint32_t *){base}.ram_ptr, {base}.modbus_addr, {base}.length);"
@@ -1073,6 +1296,77 @@ def get_generic_func_call(var_type: str, base: str) -> str:
         return f"modbus_sender_generic_float((const float *){base}.ram_ptr, {base}.modbus_addr, {base}.length);"
     else:
         return f"/* Unsupported type: {var_type} */"
+
+
+def build_master_entry(
+    row_number: int,
+    var_name: str,
+    var_type: str,
+    modbus_addr: int,
+    length: int,
+    min_value,
+    max_value,
+    default_value,
+) -> dict:
+    normalized_type = normalize_master_type(var_type)
+    master_var_name = f"master_{var_name}"
+
+    if normalized_type == "string":
+        default_text = validate_string_entry(
+            length, min_value, max_value, default_value
+        )
+        return {
+            "name": var_name,
+            "type": "REG_TYPE_MASTER_STRING",
+            "addr": modbus_addr,
+            "modbus_addr": modbus_addr,
+            "length": length,
+            "ram_decl": generate_static_definition(
+                normalized_type, master_var_name, length, default_text
+            ),
+            "ram_ptr": master_var_name,
+            "default_value": default_text,
+            "min_value": None,
+            "max_value": None,
+            "size": f"sizeof(char) * {length}",
+            "raw_var_type": normalized_type,
+            "vdef_str": default_text,
+            "vmin_str": "-",
+            "vmax_str": "-",
+            "access": "ACCESS_MODE_MASTER_READWRITE",
+        }
+
+    vmin_str = str(min_value).strip() if pd.notna(min_value) else "0"
+    vmax_str = str(max_value).strip() if pd.notna(max_value) else "0xFFFF"
+    vdef_str = str(default_value).strip() if pd.notna(default_value) else "0"
+    ram_decl = generate_static_definition(
+        normalized_type, master_var_name, length, vdef_str
+    )
+    ram_ptr = master_var_name if length > 1 else f"&{master_var_name}"
+
+    def format_array_init(value):
+        return ", ".join(
+            [format_value_for_init(normalized_type, value)] * length
+        )
+
+    return {
+        "name": var_name,
+        "type": map_type_master(normalized_type, length > 1),
+        "addr": modbus_addr,
+        "modbus_addr": modbus_addr,
+        "length": length,
+        "ram_decl": ram_decl,
+        "ram_ptr": ram_ptr,
+        "default_value": f"&({normalized_type}){{{format_array_init(vdef_str)}}}",
+        "min_value": f"&({normalized_type}){{{format_array_init(vmin_str)}}}",
+        "max_value": f"&({normalized_type}){{{format_array_init(vmax_str)}}}",
+        "size": f"sizeof({normalized_type}) * {length}",
+        "raw_var_type": normalized_type,
+        "vdef_str": vdef_str,
+        "vmin_str": vmin_str,
+        "vmax_str": vmax_str,
+        "access": "ACCESS_MODE_MASTER_READWRITE",
+    }
 
 def write_modbus_reg_map_master_h(out_dir, entries, length_defs):
     h_lines = []
@@ -1093,6 +1387,7 @@ def write_modbus_reg_map_master_h(out_dir, entries, length_defs):
     h_lines.append("    REG_TYPE_MASTER_UINT16,")
     h_lines.append("    REG_TYPE_MASTER_UINT32,")
     h_lines.append("    REG_TYPE_MASTER_FLOAT,")
+    h_lines.append("    REG_TYPE_MASTER_STRING,")
     h_lines.append("    REG_TYPE_MASTER_UINT16_ARRAY,")
     h_lines.append("    REG_TYPE_MASTER_UINT32_ARRAY,")
     h_lines.append("    REG_TYPE_MASTER_FLOAT_ARRAY")
@@ -1122,11 +1417,13 @@ def write_modbus_reg_map_master_h(out_dir, entries, length_defs):
     h_lines.append("")
     h_lines.append("extern const reg_table_master_entry_t g_reg_table_master[];")
     h_lines.append("extern const uint16_t g_reg_table_master_size;")
+    h_lines.append("uint16_t modbus_master_string_field_length(const char *data, uint16_t field_size);")
+    h_lines.append("int modbus_master_string_field_is_valid(const char *data, uint16_t field_size);")
 
     h_lines.append("")
     h_lines.append("#endif")
 
-    with open(os.path.join(out_dir, "modbus_reg_map_master.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_map_master.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
 
 def write_modbus_reg_map_master_c(out_dir, entries):
@@ -1134,6 +1431,16 @@ def write_modbus_reg_map_master_c(out_dir, entries):
 
     for e in entries:
         c_lines.append(e["ram_decl"])  # static変数定義
+
+        if e["type"] == "REG_TYPE_MASTER_STRING":
+            default_init = format_string_field_initializer(
+                e["default_value"], e["length"]
+            )
+            c_lines.append(
+                f"const char default_master_{e['name']}[{e['length']}] = {default_init};"
+            )
+            c_lines.append("")
+            continue
 
         value_type = e['ram_decl'].split()[1]  # 型名（例: uint16_t）
         count = e['length']
@@ -1155,8 +1462,12 @@ def write_modbus_reg_map_master_c(out_dir, entries):
         c_lines.append(f"        {e['modbus_addr']},")
         c_lines.append(f"        {e['size']},")
         c_lines.append(f"        default_master_{e['name']},")
-        c_lines.append(f"        min_master_{e['name']},")
-        c_lines.append(f"        max_master_{e['name']},")
+        if e["type"] == "REG_TYPE_MASTER_STRING":
+            c_lines.append("        (const void *)0,")
+            c_lines.append("        (const void *)0,")
+        else:
+            c_lines.append(f"        min_master_{e['name']},")
+            c_lines.append(f"        max_master_{e['name']},")
         c_lines.append(f"        {e['ram_ptr']},")
         c_lines.append(f"        {e['type']},")
         c_lines.append(f"        {e['length']},")
@@ -1165,8 +1476,57 @@ def write_modbus_reg_map_master_c(out_dir, entries):
     c_lines.append("};\n")
 
     c_lines.append("const uint16_t g_reg_table_master_size = (uint16_t)(sizeof(g_reg_table_master) / sizeof(g_reg_table_master[0]));")
+    c_lines.extend([
+        "",
+        "uint16_t modbus_master_string_field_length(const char *data, uint16_t field_size)",
+        "{",
+        "    uint16_t length = 0U;",
+        "",
+        "    if (data == (const char *)0)",
+        "    {",
+        "        return 0U;",
+        "    }",
+        "    while ((length < field_size) && (data[length] != '\\0'))",
+        "    {",
+        "        ++length;",
+        "    }",
+        "    return length;",
+        "}",
+        "",
+        "int modbus_master_string_field_is_valid(const char *data, uint16_t field_size)",
+        "{",
+        "    uint16_t i;",
+        "    int found_nul = 0;",
+        "    unsigned char ch;",
+        "",
+        "    if ((data == (const char *)0) || (field_size == 0U))",
+        "    {",
+        "        return 0;",
+        "    }",
+        "    for (i = 0U; i < field_size; ++i)",
+        "    {",
+        "        ch = (unsigned char)data[i];",
+        "        if (found_nul != 0)",
+        "        {",
+        "            if (ch != 0U)",
+        "            {",
+        "                return 0;",
+        "            }",
+        "        }",
+        "        else if (ch == 0U)",
+        "        {",
+        "            found_nul = 1;",
+        "        }",
+        "        else if ((ch < 0x20U) || (ch > 0x7EU))",
+        "        {",
+        "            return 0;",
+        "        }",
+        "    }",
+        "    return 1;",
+        "}",
+    ])
 
-    with open(os.path.join(out_dir, "modbus_reg_map_master.c"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_reg_map_master.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 
@@ -1297,6 +1657,14 @@ def write_modbus_sender_gen_c(c_path, entries, read_plans=None, write_plans=None
                     c_lines.append(f"        regs[{reg_offset}U] = (uint16_t)(conv.u >> 16U);")
                     c_lines.append(f"        regs[{reg_offset + 1}U] = (uint16_t)(conv.u & 0xFFFFU);")
                     c_lines.append("    }")
+            elif "STRING" in entry_type:
+                for index in range(0, length, 2):
+                    reg_offset = offset + (index // 2)
+                    c_lines.append(
+                        f"    regs[{reg_offset}U] = "
+                        f"(uint16_t)(((uint16_t)(uint8_t)((const char *){base}.ram_ptr)[{index}U] << 8U) | "
+                        f"(uint16_t)(uint8_t)((const char *){base}.ram_ptr)[{index + 1}U]);"
+                    )
 
         c_lines.append("")
         c_lines.append(
@@ -1319,7 +1687,7 @@ def write_modbus_sender_gen_c(c_path, entries, read_plans=None, write_plans=None
         ''
     ])
 
-    with open(c_path, "w", encoding="utf-8") as f:
+    with open(c_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 def write_modbus_sender_generic(out_dir):
@@ -1333,10 +1701,11 @@ def write_modbus_sender_generic(out_dir):
         "int modbus_sender_generic_u16(const uint16_t *data, uint16_t addr, uint16_t len);",
         "int modbus_sender_generic_u32(const uint32_t *data, uint16_t addr, uint16_t len);",
         "int modbus_sender_generic_float(const float *data, uint16_t addr, uint16_t len);",
+        "int modbus_sender_generic_string(const char *data, uint16_t addr, uint16_t byte_len);",
         "",
         "#endif"
     ]
-    with open(os.path.join(out_dir, "modbus_sender_generic.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_sender_generic.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
     
     # 実装ファイル（u16/u32/float 実装）
@@ -1345,6 +1714,7 @@ def write_modbus_sender_generic(out_dir):
         '#include "modbus_crc_util.h"',
         '#include "modbus_sender_gen.h"',
         '#include "modbus_reg_idx_master.h"',
+        '#include "modbus_reg_map_master.h"',
         "",
         "int modbus_sender_generic_u16(const uint16_t *data, uint16_t addr, uint16_t len)",
         "{",
@@ -1421,7 +1791,44 @@ def write_modbus_sender_generic(out_dir):
         "    return 0;",
         "}"
     ]
-    with open(os.path.join(out_dir, "modbus_sender_generic.c"), "w", encoding="utf-8") as f:
+    c_lines.extend([
+        "",
+        "int modbus_sender_generic_string(const char *data, uint16_t addr, uint16_t byte_len)",
+        "{",
+        "    uint8_t frame[256];",
+        "    uint16_t i;",
+        "    uint16_t pos = 0U;",
+        "    uint16_t reg_count;",
+        "    uint16_t total_len;",
+        "",
+        "    if ((data == (const char *)0) || (byte_len < 2U) ||",
+        "        ((byte_len % 2U) != 0U) || (byte_len > 246U))",
+        "    {",
+        "        return -1;",
+        "    }",
+        "    if (modbus_master_string_field_is_valid(data, byte_len) == 0)",
+        "    {",
+        "        return -1;",
+        "    }",
+        "    reg_count = (uint16_t)(byte_len / 2U);",
+        "    frame[pos++] = MODBUS_SLAVE_ADDR;",
+        "    frame[pos++] = 0x10U;",
+        "    frame[pos++] = (uint8_t)(addr >> 8U);",
+        "    frame[pos++] = (uint8_t)(addr & 0xFFU);",
+        "    frame[pos++] = (uint8_t)(reg_count >> 8U);",
+        "    frame[pos++] = (uint8_t)(reg_count & 0xFFU);",
+        "    frame[pos++] = (uint8_t)byte_len;",
+        "",
+        "    for (i = 0U; i < byte_len; ++i)",
+        "    {",
+        "        frame[pos++] = (uint8_t)(unsigned char)data[i];",
+        "    }",
+        "    total_len = modbus_append_crc(frame, pos);",
+        "    modbus_sender_output(frame, total_len);",
+        "    return 0;",
+        "}",
+    ])
+    with open(os.path.join(out_dir, "modbus_sender_generic.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 def write_modbus_crc_util(out_dir):
@@ -1436,7 +1843,7 @@ def write_modbus_crc_util(out_dir):
         "",
         "#endif"
     ]
-    with open(os.path.join(out_dir, "modbus_crc_util.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_crc_util.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
 
     # 実装ファイル
@@ -1474,7 +1881,7 @@ def write_modbus_crc_util(out_dir):
         "    return (uint16_t)(len_without_crc + 2U);",
         "}"
     ]
-    with open(os.path.join(out_dir, "modbus_crc_util.c"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_crc_util.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
 def write_modbus_sender_gen_h(out_dir, entries, read_plans=None, write_plans=None):
@@ -1510,7 +1917,7 @@ def write_modbus_sender_gen_h(out_dir, entries, read_plans=None, write_plans=Non
     h_lines.append("")
     h_lines.append("#endif")
 
-    with open(os.path.join(out_dir, "modbus_sender_gen.h"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "modbus_sender_gen.h"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(h_lines))
 
 def main():
@@ -1565,45 +1972,22 @@ def main():
 
         length = resolve_length(row[5], length_defs)
 
-        vmin_str = str(row[7]).strip() if pd.notna(row[7]) else "0"        # Min
-        vmax_str = str(row[8]).strip() if pd.notna(row[8]) else "0xFFFF"   # Max
-        vdef_str = str(row[9]).strip() if pd.notna(row[9]) else "0"        # Default
-
-        # vdef/vmin/vmax を文字列で取得（空欄は空文字）
-        #vdef_str = str(row[7]).strip() if pd.notna(row[7]) else "0"
-        #vmin_str = str(row[8]).strip() if pd.notna(row[5]) else "0"
-        #vmax_str = str(row[9]).strip() if pd.notna(row[6]) else "0xFFFF"
-
-        # RAM宣言を追加
-        master_var_name = f"master_{var_name}"
-        ram_decl = generate_static_definition(var_type, master_var_name, length, vdef_str)
-        ram_ptr = f"{master_var_name}" if length > 1 else f"&{master_var_name}"
-
-        def format_array_init(val):
-            return ", ".join([format_value_for_init(var_type, val)] * length)
-
-        type_master = map_type_master(var_type, length > 1)
-
-        entries.append({
-            "name": var_name,
-            "type": type_master,
-            "addr": modbus_addr,
-            "length": length,
-            "ram_decl": ram_decl,
-            "ram_ptr": ram_ptr,
-            "default_value": f"&({var_type}){{{format_array_init(vdef_str)}}}",
-            "min_value": f"&({var_type}){{{format_array_init(vmin_str)}}}",
-            "max_value": f"&({var_type}){{{format_array_init(vmax_str)}}}",
-            "size": f"sizeof({var_type}) * {length}",
-            "raw_var_type": var_type,
-            "vdef_str": vdef_str,
-            "vmin_str": vmin_str,
-            "vmax_str": vmax_str,
-            "access": "ACCESS_MODE_MASTER_READWRITE",
-        })
-
-    for entry in entries:
-        entry["modbus_addr"] = entry["addr"]  # map_master.c側で必要になるので補完
+        try:
+            entries.append(
+                build_master_entry(
+                    row_number=i + 1,
+                    var_name=var_name,
+                    var_type=var_type,
+                    modbus_addr=modbus_addr,
+                    length=length,
+                    min_value=row[7],
+                    max_value=row[8],
+                    default_value=row[9],
+                )
+            )
+        except ValueError as exc:
+            print(f"Error: RegisterTable row {i + 1} {var_name}: {exc}")
+            return
 
     write_plans = validate_write_plans(write_plans, entries)
     if write_plans is None:
