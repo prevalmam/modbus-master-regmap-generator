@@ -27,6 +27,18 @@ def is_string_type(var_type: str) -> bool:
     return normalize_master_type(var_type) == "string"
 
 
+def map_access_master(raw_access) -> str:
+    """Map slave permissions, retaining RW for legacy blank Access cells."""
+    value = "" if pd.isna(raw_access) else str(raw_access).strip().upper()
+    if value in ("R", "RO"):
+        return "ACCESS_MODE_MASTER_READ"
+    if value == "W":
+        return "ACCESS_MODE_MASTER_WRITE"
+    if value in ("", "RW"):
+        return "ACCESS_MODE_MASTER_READWRITE"
+    raise ValueError(f"unsupported Access '{raw_access}'. Use R, RO, W, or RW.")
+
+
 def resolve_string_default(raw_value) -> str:
     if pd.isna(raw_value) or str(raw_value).strip() == "":
         raise ValueError("string Default must not be blank. Use '-' for an empty string.")
@@ -425,6 +437,12 @@ def validate_write_plans(write_plans: list, entries: list):
                     f"'{entry['name']}' ({entry_start}..{entry_end})."
                 )
                 continue
+
+            if entry["access"] == "ACCESS_MODE_MASTER_READ":
+                errors.append(
+                    f"WritePlan group '{plan['group_name']}' includes read-only "
+                    f"RegisterTable entry '{entry['name']}' ({entry_start}..{entry_end})."
+                )
 
             segments.append(entry)
 
@@ -1307,8 +1325,10 @@ def build_master_entry(
     min_value,
     max_value,
     default_value,
+    access="RW",
 ) -> dict:
     normalized_type = normalize_master_type(var_type)
+    access_mode = map_access_master(access)
     master_var_name = f"master_{var_name}"
 
     if normalized_type == "string":
@@ -1333,7 +1353,7 @@ def build_master_entry(
             "vdef_str": default_text,
             "vmin_str": "-",
             "vmax_str": "-",
-            "access": "ACCESS_MODE_MASTER_READWRITE",
+            "access": access_mode,
         }
 
     vmin_str = str(min_value).strip() if pd.notna(min_value) else "0"
@@ -1365,7 +1385,7 @@ def build_master_entry(
         "vdef_str": vdef_str,
         "vmin_str": vmin_str,
         "vmax_str": vmax_str,
-        "access": "ACCESS_MODE_MASTER_READWRITE",
+        "access": access_mode,
     }
 
 def write_modbus_reg_map_master_h(out_dir, entries, length_defs):
@@ -1402,7 +1422,6 @@ def write_modbus_reg_map_master_h(out_dir, entries, length_defs):
 
     h_lines.append("")
     h_lines.append("typedef struct {")
-    h_lines.append("    const char * name;")
     h_lines.append("    uint16_t     modbus_addr;")
     h_lines.append("    uint16_t     size;")
     h_lines.append("    const void * default_value;")
@@ -1419,6 +1438,7 @@ def write_modbus_reg_map_master_h(out_dir, entries, length_defs):
     h_lines.append("extern const uint16_t g_reg_table_master_size;")
     h_lines.append("uint16_t modbus_master_string_field_length(const char *data, uint16_t field_size);")
     h_lines.append("int modbus_master_string_field_is_valid(const char *data, uint16_t field_size);")
+    h_lines.append("int modbus_master_write_range_is_allowed(uint16_t addr, uint32_t reg_count);")
 
     h_lines.append("")
     h_lines.append("#endif")
@@ -1458,7 +1478,6 @@ def write_modbus_reg_map_master_c(out_dir, entries):
     c_lines.append("const reg_table_master_entry_t g_reg_table_master[] = {")
     for e in entries:
         c_lines.append("    {")
-        c_lines.append(f"        \"{e['name']}\",")
         c_lines.append(f"        {e['modbus_addr']},")
         c_lines.append(f"        {e['size']},")
         c_lines.append(f"        default_master_{e['name']},")
@@ -1526,6 +1545,45 @@ def write_modbus_reg_map_master_c(out_dir, entries):
         "}",
     ])
 
+    c_lines.extend([
+        "",
+        "int modbus_master_write_range_is_allowed(uint16_t addr, uint32_t reg_count)",
+        "{",
+        "    uint16_t i;",
+        "    uint32_t start_addr;",
+        "    uint32_t end_addr;",
+        "    uint32_t entry_start;",
+        "    uint32_t entry_end;",
+        "    const reg_table_master_entry_t *entry;",
+        "",
+        "    if ((reg_count == 0UL) || (reg_count > 123UL))",
+        "    {",
+        "        return 0;",
+        "    }",
+        "    start_addr = (uint32_t)addr;",
+        "    end_addr = start_addr + reg_count;",
+        "    if (end_addr > 0x10000UL)",
+        "    {",
+        "        return 0;",
+        "    }",
+        "    for (i = 0U; i < g_reg_table_master_size; ++i)",
+        "    {",
+        "        entry = &g_reg_table_master[i];",
+        "        if (entry->access != ACCESS_MODE_MASTER_READ)",
+        "        {",
+        "            continue;",
+        "        }",
+        "        entry_start = (uint32_t)entry->modbus_addr;",
+        "        entry_end = entry_start + ((uint32_t)entry->size / 2UL);",
+        "        if ((start_addr < entry_end) && (entry_start < end_addr))",
+        "        {",
+        "            return 0;",
+        "        }",
+        "    }",
+        "    return 1;",
+        "}",
+    ])
+
     with open(os.path.join(out_dir, "modbus_reg_map_master.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(c_lines))
 
@@ -1570,6 +1628,7 @@ def write_modbus_sender_gen_c(c_path, entries, read_plans=None, write_plans=None
         '    uint16_t i;',
         '',
         '    if ((regs == (const uint16_t *)0) || (reg_count == 0U) || (reg_count > 123U)) return;',
+        '    if (modbus_master_write_range_is_allowed(start_addr, reg_count) == 0) return;',
         '',
         '    frame[pos++] = MODBUS_SLAVE_ADDR;',
         '    frame[pos++] = 0x10;',
@@ -1595,6 +1654,7 @@ def write_modbus_sender_gen_c(c_path, entries, read_plans=None, write_plans=None
         # set 関数の実装        
         c_lines.append(f"void modbus_sender_set_{e['name']}(void)")
         c_lines.append("{")
+        c_lines.append(f"    if ({base}.access == ACCESS_MODE_MASTER_READ) return;")
         c_lines.append(f"    {get_generic_func_call(e['type'], base)}")
         c_lines.append("}")
         c_lines.append("")
@@ -1721,6 +1781,12 @@ def write_modbus_sender_generic(out_dir):
         "    uint8_t frame[256];",
         "    uint16_t i, pos = 0;",
         "",
+        "    if ((data == (const uint16_t *)0) ||",
+        "        (modbus_master_write_range_is_allowed(addr, (uint32_t)len) == 0))",
+        "    {",
+        "        return -1;",
+        "    }",
+        "",
         "    frame[pos++] = MODBUS_SLAVE_ADDR;",
         "    frame[pos++] = 0x10;",
         "    frame[pos++] = (uint8_t)(addr >> 8);",
@@ -1743,6 +1809,12 @@ def write_modbus_sender_generic(out_dir):
         "{",
         "    uint8_t frame[256];",
         "    uint16_t i, pos = 0;",
+        "",
+        "    if ((data == (const uint32_t *)0) ||",
+        "        (modbus_master_write_range_is_allowed(addr, (uint32_t)len * 2UL) == 0))",
+        "    {",
+        "        return -1;",
+        "    }",
         "",
         "    frame[pos++] = MODBUS_SLAVE_ADDR;",
         "    frame[pos++] = 0x10;",
@@ -1769,6 +1841,12 @@ def write_modbus_sender_generic(out_dir):
         "    uint8_t frame[256];",
         "    uint16_t i, pos = 0;",
         "    union { float f; uint32_t u; } conv;",
+        "",
+        "    if ((data == (const float *)0) ||",
+        "        (modbus_master_write_range_is_allowed(addr, (uint32_t)len * 2UL) == 0))",
+        "    {",
+        "        return -1;",
+        "    }",
         "",
         "    frame[pos++] = MODBUS_SLAVE_ADDR;",
         "    frame[pos++] = 0x10;",
@@ -1811,6 +1889,10 @@ def write_modbus_sender_generic(out_dir):
         "        return -1;",
         "    }",
         "    reg_count = (uint16_t)(byte_len / 2U);",
+        "    if (modbus_master_write_range_is_allowed(addr, reg_count) == 0)",
+        "    {",
+        "        return -1;",
+        "    }",
         "    frame[pos++] = MODBUS_SLAVE_ADDR;",
         "    frame[pos++] = 0x10U;",
         "    frame[pos++] = (uint8_t)(addr >> 8U);",
@@ -1983,6 +2065,7 @@ def main():
                     min_value=row[7],
                     max_value=row[8],
                     default_value=row[9],
+                    access=row[6],
                 )
             )
         except ValueError as exc:

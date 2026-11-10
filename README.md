@@ -1,5 +1,7 @@
 # modbus-master-regmap-generator
 
+生成Cのレジスタテーブルから `name` メンバーと名前文字列を削除しています。Excel の `VarName` は、関数名やインデックス定数の生成に引き続き使用します。生成コードの更新時は `modbus_reg_map_master.h` と `modbus_reg_map_master.c` を組で更新してください。
+
 **modbus-master-regmap-generator** は，Modbus マスタ側のレジスタマップ仕様書（Excel）から，
 
 - send/request フレーム生成用関数
@@ -195,6 +197,12 @@ void poll_uptime_sec(void)
 - データ型ごとに `modbus_sender_generic_u16/u32/float/string()` が内部で選択され、必要なバイト長や配列展開をすべて自動で行います。
 - 配列レジスタの場合もブロック全体を 1 パケットで送るのが基本です。
 
+Excelの `Access` はslave側の通信権限として保持します。`R`（`RO`も可）の項目で `modbus_sender_set_<VarName>()` を呼んでも、WRITE要求は送信せずに戻ります。関数の宣言・定義は互換性のため残します。
+
+`WritePlan` にR項目を含めた場合は、グループ名と該当項目を示すエラーで生成を中止し、既存の生成ファイルを上書きしません。R項目を飛ばして送信することはありません。
+
+`modbus_sender_generic_u16/u32/float/string()` を直接呼ぶ場合も、送信範囲が定義済みR項目のいずれかのレジスタに重なると `-1` を返し、送信しません。定義されていないアドレスへの直接送信は従来どおり許可します。
+
 ```c
 void update_device_mode(uint16_t new_value)
 {
@@ -236,6 +244,8 @@ void update_device_mode(uint16_t new_value)
     set_master_process_value(36.5f);
 
 なお、setter は min/max チェックを自動で行います。 範囲外の値をセットしようとした場合は何も変更されません。
+
+ローカルgetter／setterとREAD要求・応答のRAM反映は `Access` による制限の対象外です。今回の制限はslaveへのWRITEだけで、`W` 項目に対するREAD処理も従来どおりです。
 
 #### 4.5.3 固定長文字列のアクセス
 
@@ -305,11 +315,14 @@ set_master_device_name("SENSOR-A");
 | `VarName` | `device_mode` | レジスタの論理名（C 変数名にも使用） |
 | `Type` | `uint16_t` / `uint32_t` / `float` / `string` / `CHAR` | 型（C コード生成に利用） |
 | `ArrayLen` | `1` / `NUM_DISCRETE_INPUTS` | 配列長。複数の場合は連続アドレスを自動展開 |
+| `Access` | `R` / `W` / `RW` | slave側の通信権限。R項目への通信WRITEを禁止 |
 | `Min` | `0` | 許容最小値（境界チェックで使用） |
 | `Max` | `3` | 許容最大値（境界チェックで使用） |
 | `Default` | `0` | 初期値 |
 
 ![入力 Excel のフォーマット例](images/format.png)
+
+`Access` は `R` → `ACCESS_MODE_MASTER_READ`、`W` → `ACCESS_MODE_MASTER_WRITE`、`RW` → `ACCESS_MODE_MASTER_READWRITE` に対応します。`RO` はRと同義です。前後の空白と英字の大小は正規化し、空欄は旧定義との互換性のためRWとして扱います。それ以外の非空値は生成エラーになります。
 
 ##### 文字列レジスタ
 
